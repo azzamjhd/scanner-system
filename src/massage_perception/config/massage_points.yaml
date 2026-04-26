@@ -1,0 +1,46 @@
+# Massage point definitions — edit this file at runtime; the node reloads it automatically.
+#
+# Each point is a weighted sum of MediaPipe BlazePose landmark positions:
+#   position = sum(weight_i * landmark_i)  +  offset
+#
+# Common landmark indices:
+#   0  = NOSE          11 = LEFT_SHOULDER   12 = RIGHT_SHOULDER
+#   13 = LEFT_ELBOW    14 = RIGHT_ELBOW     23 = LEFT_HIP
+#   24 = RIGHT_HIP
+#
+# Weights do not need to sum to 1, but they usually should for intuitive results.
+
+massage_points:
+
+  # GB21 – Jian Jing (right): 75% right shoulder, 25% left shoulder
+  Jian_Jing_R:
+    components:
+      - landmark: 12   # RIGHT_SHOULDER
+        weight: 0.75
+      - landmark: 11   # LEFT_SHOULDER
+        weight: 0.25
+    offset:
+      x: 0.0
+      y: 0.0
+
+  # GB21 – Jian Jing (left): mirror of above
+  Jian_Jing_L:
+    components:
+      - landmark: 11   # LEFT_SHOULDER
+        weight: 0.75
+      - landmark: 12   # RIGHT_SHOULDER
+        weight: 0.25
+    offset:
+      x: 0.0
+      y: 0.0
+
+  # Example: Neck centre (midpoint of both shoulders)
+  Neck_Center:
+    components:
+      - landmark: 11
+        weight: 0.5
+      - landmark: 12
+        weight: 0.5
+    offset:
+      x: 0.0
+      y: -0.02   # shift slightly upward toward the neck

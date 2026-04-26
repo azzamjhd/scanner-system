@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<robot name="medical_scanner">
+
+  <material name="gray"><color rgba="0.5 0.5 0.5 1"/></material>
+  <material name="black"><color rgba="0 0 0 1"/></material>
+
+  <!-- 1. FIXED BASE (The Bed/Rail Static Part) -->
+  <link name="base_link">
+    <visual>
+      <geometry><box size="2.0 0.5 0.1"/></geometry> <!-- 2m long rail -->
+      <material name="gray"/>
+    </visual>
+  </link>
+
+  <!-- 2. MOVING CART (The Slider) -->
+  <link name="slider_cart">
+    <visual>
+      <geometry><box size="0.1 0.15 0.05"/></geometry>
+      <material name="black"/>
+    </visual>
+  </link>
+
+  <!-- 3. THE JOINT (This connects the slider to the encoder data) -->
+  <joint name="linear_rail_joint" type="prismatic">
+    <parent link="base_link"/>
+    <child link="slider_cart"/>
+    <axis xyz="1 0 0"/> <!-- Moves along X axis -->
+    <limit lower="0.0" upper="2.0" effort="100" velocity="1.0"/>
+    <origin xyz="-1.0 0 0.1" rpy="0 0 0"/> <!-- Start at left side -->
+  </joint>
+
+  <!-- 4. THE LIDAR FRAME -->
+  <link name="laser">
+    <visual>
+      <geometry><cylinder radius="0.03" length="0.04"/></geometry>
+      <material name="black"/>
+    </visual>
+  </link>
+
+  <!-- 5. LIDAR MOUNT (Rotated 90 degrees to scan vertical slices) -->
+  <joint name="lidar_mount" type="fixed">
+    <parent link="slider_cart"/>
+    <child link="laser"/>
+    <!-- rpy="Roll Pitch Yaw". Roll=1.57 (90deg) turns it on its side -->
+    <origin xyz="0 0 0.05" rpy="1.5708 0 0"/> 
+  </joint>
+
+</robot>

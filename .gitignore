@@ -1,0 +1,19 @@
+# Colcon build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+.pytest_cache/
+
+# Exclude rplidar_ros (managed separately)
+src/rplidar_ros/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,11 @@
+stitcher_node:
+  ros__parameters:
+    image_topic: /camera/image_raw
+    position_topic: /current_position
+    capture_spacing_mm: 5.0
+    min_motion_for_frame_mm: 0.5
+    max_frame_buffer: 300
+    preview_scale: 0.35
+    preview_publish_period_ms: 250
+    preview_max_frames: 10
+    output_dir: /tmp/gantry_stitcher
