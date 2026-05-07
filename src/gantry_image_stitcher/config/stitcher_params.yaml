@@ -9,3 +9,6 @@ stitcher_node:
     preview_publish_period_ms: 250
     preview_max_frames: 10
     output_dir: /tmp/gantry_stitcher
+    stitcher_detector: sift
+    stitcher_nfeatures: 1000
+    stitcher_confidence: 0.3
