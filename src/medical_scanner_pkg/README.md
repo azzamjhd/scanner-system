@@ -65,7 +65,7 @@ ros2 run medical_scanner_pkg scanner_3d_node --ros-args \
   -p angle_max:=360.0 \
   -p range_max:=12.0 \
   -p ticks_per_unit:=100.0 \
-  -p axis:=0 \
+  -p axis:=1 \
   -p output_dir:=/tmp/scans \
   -p lidar_topic:=/scan \
   -p position_topic:=/current_position
@@ -178,7 +178,7 @@ Parameters:
 | `angle_max` | `90.0` | Max accepted scan angle (deg) |
 | `range_max` | `12.0` | Max accepted distance (m) |
 | `ticks_per_unit` | `100.0` | Simulation increment scale (used when `simulate_encoder=true`) |
-| `axis` | `0` | `0`: rotational Y, `1`: linear Z |
+| `axis` | `1` | `0`: rotational Y, `1`: linear Z |
 | `simulate_encoder` | `false` | Use synthetic encoder increment |
 | `output_dir` | `/tmp` | Output directory for saved scans |
 | `lidar_topic` | `/scan` | LaserScan input topic |

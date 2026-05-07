@@ -22,7 +22,7 @@ class Scanner3DNode(Node):
         self.declare_parameter('angle_max', 90.0)
         self.declare_parameter('range_max', 12.0)
         self.declare_parameter('ticks_per_unit', 100.0)
-        self.declare_parameter('axis', 0)  # 0=Rotational Y, 1=Linear Z
+        self.declare_parameter('axis', 1)  # 0=Rotational Y, 1=Linear Z (gantry default)
         self.declare_parameter('simulate_encoder', False)
         self.declare_parameter('output_dir', '/tmp')
         self.declare_parameter('lidar_topic', '/scan')
@@ -46,6 +46,7 @@ class Scanner3DNode(Node):
         self.point_cloud = []
         self.current_position_value = 0.0
         self.simulated_position_value = 0.0
+        self._warned_position_unit_mismatch = False
         
         # Timer for publishing accumulated point cloud
         self.viz_timer = self.create_timer(0.5, self.publish_accumulated_pointcloud)  # 2 Hz
@@ -109,6 +110,18 @@ class Scanner3DNode(Node):
             elif param.name == 'simulate_encoder':
                 self.simulate_encoder = param.value
                 self.get_logger().info(f'Updated simulate_encoder to {param.value}')
+            elif param.name == 'axis':
+                if param.value not in (0, 1):
+                    return SetParametersResult(
+                        successful=False,
+                        reason='axis must be 0 (rotational) or 1 (linear)'
+                    )
+                self.axis = param.value
+                self._warned_position_unit_mismatch = False
+                self.get_logger().info(
+                    f'Updated axis to {param.value} '
+                    f'({"Rotational Y" if param.value == 0 else "Linear Z"})'
+                )
         
         return SetParametersResult(successful=True)
         
@@ -172,6 +185,20 @@ class Scanner3DNode(Node):
             self.simulated_position_value += 1.0 / self.ticks_per_unit
         else:
             position = self.current_position_value
+
+        # Helpful guard for common misconfiguration:
+        # gantry encoders publish mm, but rotational mode expects degrees.
+        if (
+            self.axis == 0
+            and not self.simulate_encoder
+            and not self._warned_position_unit_mismatch
+            and abs(position) > 360.0
+        ):
+            self.get_logger().warn(
+                'axis=0 expects encoder angle in degrees, but /current_position is '
+                f'{position:.2f} (likely mm). Set axis:=1 for linear gantry scans.'
+            )
+            self._warned_position_unit_mismatch = True
         
         # Temporary list for this scan's points
         scan_points = []

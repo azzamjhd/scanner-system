@@ -27,6 +27,7 @@ setup(
         'console_scripts': [
             'scanner_3d_node = medical_scanner_pkg.scanner_3d_node:main',
             'scanner_gui = medical_scanner_pkg.scanner_gui_node:main',
+            'gantry_bridge_node = medical_scanner_pkg.gantry_bridge_node:main',
         ],
     },
 )

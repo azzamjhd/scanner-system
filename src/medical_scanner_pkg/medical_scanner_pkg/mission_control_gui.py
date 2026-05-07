@@ -88,23 +88,32 @@ PALETTES = {
 
 # ───────────────────────── HELPERS ─────────────────────────
 
+def _families():
+    """Return installed font families — compatible with Qt5 instance and Qt6 static API."""
+    db = QFontDatabase()
+    try:
+        return db.families()
+    except TypeError:
+        return QFontDatabase.families()
+
+
 def _font(family='Inter', size=11, weight=QFont.Normal, mono=False):
     """Return a QFont — falls back gracefully if Inter/JetBrains Mono not installed."""
+    installed = _families()
     if mono:
         f = QFont('JetBrains Mono', size)
         f.setStyleHint(QFont.Monospace)
-        # on Linux, fall back to common monos
-        if not QFontDatabase().hasFamily('JetBrains Mono'):
+        if 'JetBrains Mono' not in installed:
             for cand in ('Fira Code', 'Source Code Pro', 'DejaVu Sans Mono',
                          'Liberation Mono', 'Menlo', 'Consolas', 'monospace'):
-                if QFontDatabase().hasFamily(cand):
+                if cand in installed:
                     f = QFont(cand, size); f.setStyleHint(QFont.Monospace); break
     else:
         f = QFont(family, size)
-        if not QFontDatabase().hasFamily(family):
+        if family not in installed:
             for cand in ('Helvetica Neue', 'Helvetica', 'Arial',
                          'Cantarell', 'Ubuntu', 'Sans Serif'):
-                if QFontDatabase().hasFamily(cand):
+                if cand in installed:
                     f = QFont(cand, size); break
     f.setWeight(weight)
     return f
