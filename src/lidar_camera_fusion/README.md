@@ -1,37 +1,42 @@
 # lidar_camera_fusion
 
-A ROS 2 Jazzy C++ package that combines an RPLiDAR A1 and a USB camera into a custom RGB-D sensor. It provides two nodes:
+A ROS 2 Jazzy C++ package that fuses an RPLiDAR A1 and a USB camera into a
+custom RGB-D sensor. It provides two nodes and a complete single-command
+system bringup.
 
-1. **`scan_assembler_node`** — projects 2D laser sweeps into an accumulating 3D point cloud using the official `laser_geometry` + TF2 pipeline.
-2. **`cloud_colorizer_node`** — colorizes the 3D cloud by pinhole-projecting it onto a synchronized camera frame.
+| Node | Role |
+|---|---|
+| `scan_assembler_node` | Accumulates 2D laser rings into a growing 3D point cloud using `laser_geometry` + TF2. Built-in gantry bridge converts `/current_position` (mm) → `/joint_states` (m) so `robot_state_publisher` keeps the TF tree live. |
+| `cloud_colorizer_node` | Colorizes each per-scan cloud against its time-synchronized camera frame and accumulates colored points. |
 
 ---
 
-## System Overview
+## System overview
 
 ```
 ESP32 firmware
   └── /current_position (Float32, mm)
-        └── gantry_bridge_node  ──►  /joint_states
+        │
+        └── scan_assembler_node  ← built-in bridge: mm÷1000 → /joint_states
                                           │
                               robot_state_publisher
                                           │
-                                    TF2 tree published:
+                                    TF2 tree:
                               base_link → gantry_link → lidar_link
                               gantry_link → camera_link → camera_optical_frame
 
 RPLiDAR A1
-  └── /scan (LaserScan, frame_id="laser")
+  └── /scan  (LaserScan, frame_id="lidar_link")
         │
-        │   (static TF: lidar_link → laser, published by fusion.launch.py)
-        │
-        └── scan_assembler_node  ──►  /scanner/assembled_cloud (PointCloud2, base_link)
+        └── scan_assembler_node  ──►  /scanner/assembled_cloud  (PointCloud2, base_link)
+                        │
+                        └──────────►  /scanner/scan_cloud       (PointCloud2, base_link)
                                                 │
 v4l2_camera                                     │
-  ├── /image_raw  (Image)  ──────────────────►  │
-  └── /camera_info (CameraInfo) ─────────────►  cloud_colorizer_node
+  ├── /image_raw  (Image)  ──────────────────►  cloud_colorizer_node
+  └── /camera_info (CameraInfo) ─────────────►
                                                 │
-                                                └──► /scanner/colored_cloud (PointCloud2, base_link)
+                                                └──►  /scanner/colored_cloud  (PointCloud2, base_link)
 ```
 
 ### TF frame tree
@@ -39,17 +44,23 @@ v4l2_camera                                     │
 ```
 base_link  ──[prismatic gantry_joint, X-axis]──►  gantry_link
                                                         │
-                                           ┌────────────┴────────────┐
-                              [fixed -90° pitch]               [fixed offset]
-                                           │                         │
-                                      lidar_link               camera_link
-                                           │                         │
-                              [static identity TF]         [fixed optical rotation]
-                                           │                         │
-                                         laser               camera_optical_frame
+                                          ┌─────────────┴─────────────┐
+                                  [fixed, −90° pitch]          [fixed offset]
+                                          │                           │
+                                     lidar_link                  camera_link
+                                     (frame_id of /scan)              │
+                                                            [fixed optical rotation]
+                                                                       │
+                                                           camera_optical_frame
 ```
 
-The `base_link → gantry_link` edge is dynamic (driven by `/joint_states` from `gantry_bridge_node`), so as the gantry moves, every laser scan is automatically projected into the correct 3D position.
+The `base_link → gantry_link` edge is driven by `/joint_states`, which
+`scan_assembler_node` publishes whenever `/current_position` arrives from the
+ESP32 firmware. As the gantry moves, each laser ring is stamped with the
+correct 3D position in `base_link` space — this is what builds the 3D shape.
+
+> **No separate `gantry_bridge_node` is needed.** The mm → m conversion is
+> a built-in 7-line callback inside `scan_assembler_node`.
 
 ---
 
@@ -57,19 +68,34 @@ The `base_link → gantry_link` edge is dynamic (driven by `/joint_states` from 
 
 ### `scan_assembler_node`
 
-Converts incoming 2D `LaserScan` messages into a growing 3D `PointCloud2` by using `laser_geometry` and the live TF2 tree.
+Converts incoming `LaserScan` messages into a growing 3D `PointCloud2`.
 
 | | |
 |---|---|
-| **Subscribes** | `/scan` — `sensor_msgs/msg/LaserScan` (SensorDataQoS) |
-| **Publishes** | `/scanner/assembled_cloud` — `sensor_msgs/msg/PointCloud2` (SensorDataQoS, timer-driven) |
-| **Service** | `/scanner/clear_cloud` — `std_srvs/srv/Trigger` |
+| **Subscribes** | `/scan` — `sensor_msgs/LaserScan` (SensorDataQoS) |
+| **Subscribes** | `/current_position` — `std_msgs/Float32` (mm) |
+| **Publishes** | `/scanner/assembled_cloud` — `sensor_msgs/PointCloud2` (SensorDataQoS, timer-driven) |
+| **Publishes** | `/scanner/scan_cloud` — `sensor_msgs/PointCloud2` (SensorDataQoS, per scan) |
+| **Publishes** | `/joint_states` — `sensor_msgs/JointState` (on every `/current_position` message) |
 
-**How it works:**
+#### How it works
 
-For each incoming scan, `laser_geometry::LaserProjection::transformLaserScanToPointCloud()` is called with the TF2 buffer. It looks up the transform from the scan's `frame_id` (`laser`) to `target_frame` (`base_link`) at the scan's exact timestamp, accounting for the gantry's position at that moment. The resulting 3D points are written into a **pre-allocated circular buffer** of `max_points` entries. When the buffer is full, the oldest points are overwritten automatically — no dynamic memory allocation occurs after startup.
-
-A wall timer publishes the full accumulated cloud at `publish_rate` Hz.
+1. **Guard** — `is_scanning_` (`std::atomic<bool>`) must be `true`. If not,
+   every incoming scan is dropped immediately (lock-free check).
+2. **Project** — `laser_geometry::projectLaser()` converts the 2D polar ring
+   to Cartesian XYZ in the scanner's own frame. No TF needed here.
+3. **Transform** — `tf_buffer_->lookupTransform()` fetches the exact-timestamp
+   transform from `lidar_link` → `base_link` with a 100 ms wait to absorb
+   `robot_state_publisher` latency. `tf2::doTransform()` moves the ring into
+   `base_link`.
+4. **Accumulate** — Points are written into a pre-allocated circular ring
+   buffer of `max_points` entries. When full, the oldest points are silently
+   overwritten — no heap allocation after startup.
+5. **Publish** — A wall timer serialises the buffer into a `PointCloud2` and
+   publishes at `publish_rate` Hz (decoupled from the ~10 Hz scan rate).
+6. **Gantry bridge** — Every `/current_position` message triggers
+   `position_callback`, which divides by 1000 and publishes to `/joint_states`
+   so `robot_state_publisher` animates the `gantry_joint` TF edge in real time.
 
 #### Parameters
 
@@ -77,91 +103,111 @@ A wall timer publishes the full accumulated cloud at `publish_rate` Hz.
 |---|---|---|---|
 | `target_frame` | string | `base_link` | TF frame to accumulate the cloud in |
 | `scan_topic` | string | `/scan` | LaserScan input topic |
-| `max_points` | int | `500000` | Circular buffer capacity (≈18 MB) |
-| `publish_rate` | double | `2.0` | Publish rate in Hz |
+| `joint_name` | string | `gantry_joint` | Joint name in the URDF driven by `/joint_states` |
+| `output_dir` | string | `.` | Directory where `.pcd` files are saved on `/scanner/stop` |
+| `max_points` | int | `500000` | Circular buffer capacity (≈ 18 MB for XYZ float32) |
+| `publish_rate` | double | `2.0` | Assembled-cloud publish rate in Hz |
 
 #### Services
 
 | Service | Type | Effect |
 |---|---|---|
-| `/scanner/clear_cloud` | `std_srvs/srv/Trigger` | Resets the accumulation buffer |
+| `/scanner/start` | `std_srvs/Trigger` | **Clears the buffer** then opens the accumulation gate (`is_scanning_ = true`). Every new session starts with an empty cloud. |
+| `/scanner/stop` | `std_srvs/Trigger` | Closes the gate (`is_scanning_ = false`) then **saves the accumulated cloud** to `<output_dir>/scan_YYYYMMDD_HHMMSS.pcd` as a binary PCD file. |
+| `/scanner/clear_cloud` | `std_srvs/Trigger` | Resets the buffer without changing the scanning gate state. |
 
 ---
 
 ### `cloud_colorizer_node`
 
-Projects the 3D point cloud onto a synchronized camera image to assign RGB colors to each point.
+Assigns RGB colours to the 3D cloud using a pinhole camera model.
 
 | | |
 |---|---|
-| **Subscribes (synced)** | `/scanner/assembled_cloud` — `PointCloud2` |
-| | `/image_raw` — `sensor_msgs/msg/Image` |
-| | `/camera_info` — `sensor_msgs/msg/CameraInfo` |
-| **Publishes** | `/scanner/colored_cloud` — `sensor_msgs/msg/PointCloud2` (SensorDataQoS) |
+| **Subscribes (synced)** | `/scanner/scan_cloud` — `sensor_msgs/PointCloud2` |
+| | `/image_raw` — `sensor_msgs/Image` |
+| | `/camera_info` — `sensor_msgs/CameraInfo` |
+| **Publishes** | `/scanner/colored_cloud` — `sensor_msgs/PointCloud2` (XYZRGB, `base_link`) |
 
-**How it works:**
+#### How it works
 
-1. **Time synchronization** — `message_filters::ApproximateTime` aligns the three streams within `approx_time_slop` seconds.
-2. **TF lookup** — transforms the entire cloud from `base_link` to `camera_optical_frame` at the image timestamp via `tf2::doTransform` (Eigen batch transform, no per-point overhead).
+1. **`ApproximateTime` sync** — waits for one message from each of the three
+   topics whose timestamps are within `approx_time_slop` seconds of each other.
+2. **TF lookup** — `lookupTransform(camera_optical_frame, cloud.frame_id,
+   image.stamp)` — transforms the per-scan cloud into camera space in one batch
+   call.
 3. **Pinhole projection** — for each point in the optical frame:
-   - Computes pixel `(u, v)` using the intrinsics from `CameraInfo.k`:
-     `u = fx·X/Z + cx`,  `v = fy·Y/Z + cy`
-   - Discards points with `Z ≤ 0` (behind the camera) or out-of-image-bounds.
-4. **Color sampling** — samples BGR from the `cv::Mat` at `(v, u)` and stores it in a `pcl::PointXYZRGB`.
-5. **Output frame** — the XYZ coordinates in the colored output are in the **original `base_link` frame** (not the optical frame), so `/scanner/colored_cloud` overlays exactly with `/scanner/assembled_cloud` in RViz.
+   `u = fx·X/Z + cx`, `v = fy·Y/Z + cy`. Points with `Z ≤ 0` or outside the
+   image bounds are discarded.
+4. **Colour sampling** — samples BGR from `cv::Mat` at `(v, u)`, converts to
+   RGB and stores in `pcl::PointXYZRGB`.
+5. **Output** — XYZ coordinates are the **original `base_link` values**, not
+   the optical-frame projection. The coloured cloud overlays exactly with
+   `/scanner/assembled_cloud` in RViz.
 
 #### Parameters
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `optical_frame` | string | `camera_optical_frame` | Camera optical TF frame for projection |
-| `queue_size` | int | `10` | ApproximateTime synchronizer queue depth |
-| `approx_time_slop` | double | `0.1` | Maximum time gap in seconds to consider messages synchronized |
+| `queue_size` | int | `10` | `ApproximateTime` synchroniser queue depth |
+| `approx_time_slop` | double | `0.1` | Max timestamp gap (s) to consider messages synchronised |
 
 ---
 
-## Published Topics Summary
+## Topic and service summary
 
-| Topic | Type | Frame | Publisher | Consumers |
-|---|---|---|---|---|
-| `/scanner/assembled_cloud` | `PointCloud2` | `base_link` | `scan_assembler_node` | `cloud_colorizer_node`, RViz |
-| `/scanner/colored_cloud` | `PointCloud2` | `base_link` | `cloud_colorizer_node` | RViz |
+| Topic / Service | Direction | Type | Notes |
+|---|---|---|---|
+| `/scan` | → node | `LaserScan` | rplidar_ros, `frame_id=lidar_link` |
+| `/current_position` | → node | `Float32` | ESP32 firmware, mm |
+| `/joint_states` | node → | `JointState` | Feeds `robot_state_publisher` |
+| `/scanner/assembled_cloud` | node → | `PointCloud2` | XYZ, `base_link`, 2 Hz |
+| `/scanner/scan_cloud` | node → | `PointCloud2` | XYZ, `base_link`, per scan |
+| `/scanner/colored_cloud` | node → | `PointCloud2` | XYZRGB, `base_link` |
+| `/image_raw` | → node | `Image` | v4l2_camera |
+| `/camera_info` | → node | `CameraInfo` | v4l2_camera |
+| `/scanner/start` | service | `Trigger` | Clear buffer + start scan |
+| `/scanner/stop` | service | `Trigger` | Stop scan + save `.pcd` |
+| `/scanner/clear_cloud` | service | `Trigger` | Clear buffer only |
 
 ---
 
 ## Dependencies
 
 ### ROS 2 packages
+
 | Package | Purpose |
 |---|---|
 | `rclcpp` | C++ client library |
-| `sensor_msgs`, `std_msgs`, `geometry_msgs`, `std_srvs` | Message/service types |
+| `sensor_msgs`, `std_msgs`, `geometry_msgs`, `std_srvs` | Message and service types |
 | `laser_geometry` | `LaserScan` → `PointCloud2` projection |
-| `tf2`, `tf2_ros`, `tf2_sensor_msgs`, `tf2_geometry_msgs`, `tf2_eigen` | Transform tree lookups and batch cloud transforms |
-| `pcl_conversions` | PCL ↔ ROS 2 message bridge |
+| `tf2`, `tf2_ros`, `tf2_sensor_msgs`, `tf2_geometry_msgs`, `tf2_eigen` | Transform lookups and batch cloud transforms |
+| `pcl_conversions` | PCL ↔ ROS 2 bridge |
 | `cv_bridge` | ROS 2 `Image` ↔ OpenCV `cv::Mat` |
-| `message_filters` | `ApproximateTime` synchronizer |
+| `message_filters` | `ApproximateTime` synchroniser |
 
 ### System libraries
+
 | Library | Purpose |
 |---|---|
-| PCL 1.14 (`libpcl-all-dev`) | `pcl::PointXYZRGB` and `pcl::toROSMsg` |
-| OpenCV | Image decoding and pixel sampling |
+| PCL (`libpcl-dev`, components `common` + `io`) | `pcl::PointXYZRGB`, `pcl::io::savePCDFileBinary` |
+| OpenCV | Image decode and pixel sampling |
 
-### Runtime prerequisites (must already be running)
-| Node | Launched by | Why required |
-|---|---|---|
-| `robot_state_publisher` | `scanner_bridge.launch.py` | Broadcasts the TF tree from the URDF (`base_link`, `gantry_link`, `lidar_link`, `camera_optical_frame`) |
-| `gantry_bridge_node` | `medical_scanner_pkg` | Publishes `/joint_states` so the gantry_joint TF edge tracks the encoder position |
-| `rplidar_node` | `rplidar_ros` | Publishes `/scan` |
-| `v4l2_camera_node` | `v4l2_camera` | Publishes `/image_raw` and `/camera_info` |
+### Runtime prerequisites
+
+| Process | Why required |
+|---|---|
+| `micro_ros_agent` (serial, `/dev/ttyUSB0`, 115200) | Bridges ESP32 firmware to ROS 2; provides `/current_position` |
+| `rplidar_ros rplidar_a1_launch.py` | Publishes `/scan` |
+| `robot_state_publisher` (with `urdf/scanner_bridge.urdf`) | Broadcasts TF tree from URDF |
+| `v4l2_camera_node` | Publishes `/image_raw` and `/camera_info` (required only by `cloud_colorizer_node`) |
 
 ---
 
 ## Installation
 
 ```bash
-# Install ROS 2 package dependencies
 sudo apt install -y \
   ros-jazzy-laser-geometry \
   ros-jazzy-tf2-sensor-msgs \
@@ -170,6 +216,9 @@ sudo apt install -y \
   ros-jazzy-pcl-conversions \
   ros-jazzy-cv-bridge \
   ros-jazzy-message-filters \
+  ros-jazzy-robot-state-publisher \
+  ros-jazzy-rplidar-ros \
+  ros-jazzy-v4l2-camera \
   libpcl-dev
 ```
 
@@ -188,29 +237,82 @@ source install/setup.bash
 
 ## Usage
 
-### Full system bringup (recommended order)
+### One-command bringup (recommended)
 
-**Terminal 1 — URDF + TF tree (required first)**
+```bash
+ros2 launch lidar_camera_fusion full_system.launch.py
+```
+
+All hardware defaults match the physical setup out of the box. Override
+anything on the command line:
+
+```bash
+ros2 launch lidar_camera_fusion full_system.launch.py \
+    mcu_port:=/dev/ttyUSB0             \
+    lidar_port:=/dev/ttyUSB1           \
+    camera_device:=/dev/video0         \
+    output_dir:=/home/azzam/scans      \
+    max_points:=1000000                \
+    scan_mode:=Boost
+```
+
+#### `full_system.launch.py` arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `mcu_port` | `/dev/ttyUSB0` | Serial port for micro-ROS / ESP32 |
+| `lidar_port` | `/dev/ttyUSB1` | Serial port for RPLiDAR A1 |
+| `camera_device` | `/dev/video0` | V4L2 device node |
+| `lidar_frame_id` | `lidar_link` | `frame_id` stamped on `/scan` |
+| `scan_mode` | `Standard` | RPLiDAR scan mode (`Standard` / `Express` / `Boost`) |
+| `camera_info_url` | `file:///home/azzam/Documents/webcam_calibration.yaml` | Camera calibration file |
+| `camera_frame_id` | `camera_optical_frame` | TF frame stamped on camera images |
+| `output_dir` | `~/ros2_scans` | Directory for saved `.pcd` files |
+| `max_points` | `500000` | Circular buffer capacity |
+| `publish_rate` | `2.0` | Cloud publish rate in Hz |
+| `scan_source_frame` | `lidar_link` | Passed to `fusion.launch.py` |
+
+> **Camera V4L2 controls** (`focus_absolute`, `exposure_time_absolute`) are
+> **not** set at node startup — applying them from a params file before the
+> camera begins streaming corrupts `VIDIOC_REQBUFS` on UVC cameras like the
+> C922. Set them after the node is running:
+> ```bash
+> ros2 param set /v4l2_camera_node focus_absolute 0
+> ros2 param set /v4l2_camera_node exposure_time_absolute 512
+> ```
+
+---
+
+### Manual bringup (individual terminals)
+
+If you need to start components separately — e.g. for debugging or when
+`full_system.launch.py` is too coarse-grained:
+
+**Terminal 1 — micro-ROS agent**
+```bash
+source /opt/ros/jazzy/setup.bash
+ros2 run micro_ros_agent micro_ros_agent serial --dev /dev/ttyUSB0 -b 115200
+```
+
+**Terminal 2 — RPLiDAR A1**
 ```bash
 source /opt/ros/jazzy/setup.bash && source ~/Documents/ros2_ws/install/setup.bash
-ros2 launch medical_scanner_pkg scanner_bridge.launch.py
+ros2 launch rplidar_ros rplidar_a1_launch.py \
+    serial_port:=/dev/ttyUSB1 \
+    frame_id:=lidar_link      \
+    scan_mode:=Standard
 ```
 
-**Terminal 2 — Encoder → joint states bridge**
+**Terminal 3 — TF tree (URDF lives in this package)**
 ```bash
-ros2 run medical_scanner_pkg gantry_bridge_node
-```
-
-**Terminal 3 — RPLiDAR A1**
-```bash
-ros2 launch rplidar_ros rplidar_a1_launch.py serial_port:=/dev/ttyUSB1
+ros2 launch lidar_camera_fusion scanner_bridge.launch.py
 ```
 
 **Terminal 4 — USB camera**
 ```bash
 ros2 run v4l2_camera v4l2_camera_node --ros-args \
-  -r image_raw:=/image_raw \
-  -r camera_info:=/camera_info
+    -p camera_info_url:="file:///home/azzam/Documents/webcam_calibration.yaml" \
+    -p camera_frame_id:="camera_optical_frame"
 ```
 
 **Terminal 5 — Fusion nodes**
@@ -218,163 +320,199 @@ ros2 run v4l2_camera v4l2_camera_node --ros-args \
 ros2 launch lidar_camera_fusion fusion.launch.py
 ```
 
-### Launch arguments
+---
+
+### Scan workflow
 
 ```bash
-# Change accumulation frame (unusual)
-ros2 launch lidar_camera_fusion fusion.launch.py target_frame:=base_link
+# 1. Start a new scan session (clears buffer, opens accumulation gate)
+ros2 service call /scanner/start std_srvs/srv/Trigger
 
-# Increase buffer for longer scans
-ros2 launch lidar_camera_fusion fusion.launch.py max_points:=1000000
+# 2. Move the gantry to sweep the scan volume
+ros2 topic pub /position std_msgs/msg/Float32 "{data: 100.0}" -1
 
-# Slower publish rate to reduce bandwidth
-ros2 launch lidar_camera_fusion fusion.launch.py publish_rate:=1.0
+# 3. Stop — closes gate and saves  ~/ros2_scans/scan_YYYYMMDD_HHMMSS.pcd
+ros2 service call /scanner/stop std_srvs/srv/Trigger
 
-# If rplidar is configured to publish in lidar_link frame directly
-ros2 launch lidar_camera_fusion fusion.launch.py scan_source_frame:=lidar_link
-
-# Wider time sync window (for slow cameras)
-ros2 launch lidar_camera_fusion fusion.launch.py approx_time_slop:=0.2
+# Optional: clear without stopping the gate
+ros2 service call /scanner/clear_cloud std_srvs/srv/Trigger
 ```
 
-### Visualize in RViz2
+---
+
+### Visualise in RViz2
 
 ```bash
 rviz2
 ```
 
-Recommended RViz displays:
-
 | Display | Topic | Setting |
 |---|---|---|
-| PointCloud2 | `/scanner/assembled_cloud` | Color by Z or intensity |
+| PointCloud2 | `/scanner/assembled_cloud` | Color by Z or Intensity |
 | PointCloud2 | `/scanner/colored_cloud` | Color Transformer → **RGB8** |
-| RobotModel | — | Fixed frame: `base_link` |
+| RobotModel | — | — |
 | TF | — | — |
 
 Set **Fixed Frame** to `base_link`.
 
+---
+
 ### Useful CLI checks
 
 ```bash
-# Verify TF chain is complete
+# Verify the full TF chain is live
 ros2 run tf2_tools view_frames
-# Expected edges: base_link→gantry_link→lidar_link→laser, gantry_link→camera_link→camera_optical_frame
+# Expected: base_link → gantry_link → lidar_link
+#           gantry_link → camera_link → camera_optical_frame
 
-# Spot-check a specific transform
-ros2 run tf2_ros tf2_echo base_link laser
+# Spot-check a transform
+ros2 run tf2_ros tf2_echo base_link lidar_link
 
-# Check assembled cloud is publishing
-ros2 topic hz /scanner/assembled_cloud     # should be ~2 Hz
-ros2 topic info /scanner/assembled_cloud
+# Confirm /joint_states is being published by scan_assembler_node
+ros2 topic hz /joint_states             # mirrors /current_position rate
 
-# Check colored cloud
+# Check assembled cloud rate
+ros2 topic hz /scanner/assembled_cloud  # ~2 Hz
+
+# Check colored cloud (requires camera to be running)
 ros2 topic hz /scanner/colored_cloud
-
-# Reset the accumulated cloud
-ros2 service call /scanner/clear_cloud std_srvs/srv/Trigger
 ```
 
 ---
 
 ## Troubleshooting
 
-### `"base_link" passed to lookupTransform argument target_frame does not exist`
+### `"base_link" passed to lookupTransform does not exist`
 
-**Cause:** `robot_state_publisher` is not running, so the TF tree (`base_link`, `gantry_link`, `lidar_link`, etc.) has never been broadcasted.
+**Cause:** `robot_state_publisher` is not running.
 
-**Fix:** Launch `scanner_bridge.launch.py` from `medical_scanner_pkg` **before** or alongside `fusion.launch.py`. It starts `robot_state_publisher` with the URDF that defines all the robot frames.
+**Fix:** Run `scanner_bridge.launch.py` (now in **this** package, not
+`medical_scanner_pkg`):
+```bash
+ros2 launch lidar_camera_fusion scanner_bridge.launch.py
+```
+Or use `full_system.launch.py` which starts it automatically.
+
+---
+
+### `TF transform failed: "lidar_link" does not exist`
+
+**Cause:** `robot_state_publisher` started but has not yet received a
+`/joint_states` message, so the dynamic `gantry_joint` edge is not yet in the
+buffer. This is transient at startup.
+
+**Fix:** `scan_assembler_node` waits up to 100 ms per scan for TF data and
+logs a throttled warning. The warning disappears within 1–2 seconds once
+`/current_position` messages begin arriving from the ESP32.
+
+---
+
+### RPLiDAR exits immediately with `scan mode 'Sensitivity' is not supported`
+
+**Cause:** `rplidar_a1_launch.py` defaults to `scan_mode:=Sensitivity`, which
+only exists on the S-series. The A1 supports **Standard**, **Express**, and
+**Boost** only.
+
+**Fix:** Always pass `scan_mode:=Standard` (or `Boost`) explicitly.
+`full_system.launch.py` already sets `Standard` as its default.
 
 ```bash
-# Terminal 1 (run first)
-ros2 launch medical_scanner_pkg scanner_bridge.launch.py
-
-# Terminal 2 (then fusion)
-ros2 launch lidar_camera_fusion fusion.launch.py
+ros2 launch rplidar_ros rplidar_a1_launch.py \
+    serial_port:=/dev/ttyUSB1 \
+    frame_id:=lidar_link      \
+    scan_mode:=Standard
 ```
 
 ---
 
-### `TF transform failed: "laser" passed to lookupTransform argument source_frame does not exist`
+### Camera: `Failed mapping device memory`
 
-**Cause:** The static TF `lidar_link → laser` has not been published yet, or `fusion.launch.py` is not running.
+**Cause:** Applying V4L2 hardware controls (`focus_absolute`,
+`exposure_time_absolute`) via a ROS 2 params file **before** the camera begins
+streaming corrupts the `VIDIOC_REQBUFS` (MMAP) call. This affects UVC cameras
+like the Logitech C922, whose focus and exposure controls are UVC extension
+controls — v4l2_camera cannot enumerate them at startup ("Available controls:"
+shows empty), so it never declares those ROS 2 parameters; when the params
+file tries to apply them, the camera initialisation fails.
 
-**Fix:** Ensure `fusion.launch.py` is running (it publishes the static TF). If you changed the rplidar `frame_id` parameter away from `laser`, pass the matching value:
+**Fix:** Do **not** pass these controls at node startup. Set them after the
+node is running:
 ```bash
-ros2 launch lidar_camera_fusion fusion.launch.py scan_source_frame:=<your_frame_id>
+ros2 param set /v4l2_camera_node focus_absolute 0
+ros2 param set /v4l2_camera_node exposure_time_absolute 512
 ```
+`full_system.launch.py` already omits these from startup params.
 
 ---
 
 ### `cloud_colorizer_node` callback never fires
 
-**Cause:** `ApproximateTime` cannot find three matching messages within `approx_time_slop`.
+**Cause:** `ApproximateTime` cannot find matching messages across all three
+topics within `approx_time_slop`.
 
 **Checklist:**
 ```bash
-ros2 topic hz /scanner/assembled_cloud   # should publish
-ros2 topic hz /image_raw                 # should publish
-ros2 topic hz /camera_info               # should publish
+ros2 topic hz /scanner/assembled_cloud   # ~2 Hz
+ros2 topic hz /image_raw                 # ~30 Hz
+ros2 topic hz /camera_info               # ~30 Hz
 ```
-If all three are publishing but the callback still never fires, try increasing the slop:
+If all are publishing, widen the sync window:
 ```bash
 ros2 launch lidar_camera_fusion fusion.launch.py approx_time_slop:=0.5
 ```
 
 ---
 
-### Colored cloud has very few points (most discarded)
-
-**Cause:** The camera FOV does not cover much of the laser scan, or the `camera_to_optical` TF rotation in the URDF is incorrect.
-
-**Check:** Visualize the assembled cloud and the camera image simultaneously in RViz. If the cloud extends far outside the camera's view frustum, this is expected. If the cloud appears to be *inside* the FOV but points are still discarded, verify the `camera_to_optical` joint's `rpy` in `scanner_bridge.urdf`.
-
----
-
 ### `Lookup would require extrapolation into the future`
 
-**Full message:**
-```
-TF transform failed: Lookup would require extrapolation into the future.
-Requested time T but the latest data is at time T-Δ,
-when looking up transform from frame [lidar_link] to frame [base_link]
-```
+**Cause:** The `LaserScan` stamp is ahead of the latest TF data.
+`robot_state_publisher` has a 7–80 ms latency between an encoder change and
+the `/tf` update appearing on the network.
 
-**Cause:** The LaserScan's `header.stamp` is ahead of the latest TF data in the buffer. `robot_state_publisher` publishes joint-state-driven transforms with a latency of roughly 7–80 ms, so a transform at exactly `T_scan` may not exist yet.
+**Status: handled.** The node uses `projectLaser()` (no TF, always instant)
+followed by `lookupTransform(..., 100 ms timeout)` and `tf2::doTransform()`.
+The `TransformListener` runs on a dedicated thread (`spin_thread=true`) so it
+keeps receiving `/tf` while `scan_callback` blocks in the lookup — eliminating
+the executor-deadlock root cause.
 
-**Status: Fixed in the current code.** Two changes were required:
-
-1. **`projectLaser()` + explicit `lookupTransform`** — replaced `laser_geometry::transformLaserScanToPointCloud` (which has no timeout and fails immediately on any latency) with a two-step approach: `projectLaser()` converts the 2D scan to 3D in the laser's own frame (no TF, always instant), then `lookupTransform` fetches the exact-timestamp transform with a 100 ms wait.
-
-2. **`spin_thread=true` on `TransformListener`** — this is the root fix for the persistent version of this error. With a single-threaded ROS2 executor, if `lookupTransform` blocks waiting for TF data, it occupies the same thread that the `TransformListener` uses to receive `/tf` messages — a deadlock where the lookup waits for data that can never arrive. Passing `spin_thread=true` gives the `TransformListener` its own dedicated thread, so TF messages are processed independently and the 100 ms timeout works correctly.
-
-If you still see this warning it means the TF latency on your system exceeds 100 ms. You can increase the timeout in [scan_assembler_node.cpp](src/lidar_camera_fusion/src/scan_assembler_node.cpp) at the `rclcpp::Duration(0, 100'000'000)` line (value is in nanoseconds).
+If the warning persists, your system TF latency exceeds 100 ms. Increase the
+timeout at `rclcpp::Duration(0, 100'000'000)` in `scan_assembler_node.cpp`
+(value is in nanoseconds).
 
 ---
 
-### `ApproximateTime` warning about dropped messages
+### Coloured cloud has very few points
 
-If `queue_size` is too small relative to the frequency mismatch between the cloud and the camera, messages are dropped. Increase `queue_size`:
-```bash
-ros2 launch lidar_camera_fusion fusion.launch.py queue_size:=20
-```
+**Cause:** Most scan points project outside the camera's FOV, or the
+`camera_to_optical` rotation in `scanner_bridge.urdf` is wrong.
+
+**Check:** In RViz, display both `/scanner/assembled_cloud` and the camera
+image. If the cloud visually falls inside the frustum but points are still
+discarded, verify the `rpy` of the `camera_to_optical` joint in
+`urdf/scanner_bridge.urdf`.
 
 ---
 
-## Package File Reference
+## Package layout
 
 ```
 lidar_camera_fusion/
-├── CMakeLists.txt                          Build configuration
-├── package.xml                             Package metadata and dependencies
-├── README.md                               This file
-├── include/
-│   └── lidar_camera_fusion/
-│       ├── scan_assembler_node.hpp         Node class declaration
-│       └── cloud_colorizer_node.hpp        Node class declaration
+├── CMakeLists.txt
+├── package.xml
+├── README.md
+├── urdf/
+│   └── scanner_bridge.urdf          Robot URDF — defines the full TF tree
+├── include/lidar_camera_fusion/
+│   ├── scan_assembler_node.hpp
+│   └── cloud_colorizer_node.hpp
 ├── src/
-│   ├── scan_assembler_node.cpp             LaserScan → accumulated PointCloud2
-│   └── cloud_colorizer_node.cpp           PointCloud2 + Image → colored PointCloud2
+│   ├── scan_assembler_node.cpp      LaserScan → accumulated PointCloud2
+│   │                                 + gantry bridge (/current_position → /joint_states)
+│   │                                 + /scanner/start|stop|clear_cloud services
+│   │                                 + binary PCD save on /scanner/stop
+│   └── cloud_colorizer_node.cpp     assembled cloud + image → XYZRGB cloud
 └── launch/
-    └── fusion.launch.py                    Launches both nodes + static TF bridge
+    ├── full_system.launch.py        Single-command bringup of all hardware + nodes
+    ├── scanner_bridge.launch.py     robot_state_publisher only (TF tree from URDF)
+    └── fusion.launch.py             scan_assembler + cloud_colorizer + static TF
 ```
