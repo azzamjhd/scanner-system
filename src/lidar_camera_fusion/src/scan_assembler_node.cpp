@@ -2,7 +2,14 @@
 
 #include <chrono>
 #include <cmath>
+#include <ctime>
+#include <filesystem>
 #include <functional>
+#include <stdexcept>
+
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
 
 #include "sensor_msgs/point_cloud2_iterator.hpp"
 #include "tf2_sensor_msgs/tf2_sensor_msgs.hpp"
@@ -18,11 +25,15 @@ ScanAssemblerNode::ScanAssemblerNode(const rclcpp::NodeOptions & options)
   // ── Parameters ────────────────────────────────────────────────────────────
   declare_parameter("target_frame", "base_link");
   declare_parameter("scan_topic",   "/scan");
+  declare_parameter("output_dir",   ".");
+  declare_parameter("joint_name",   "gantry_joint");
   declare_parameter("max_points",   500000);
   declare_parameter("publish_rate", 2.0);
 
   target_frame_ = get_parameter("target_frame").as_string();
   scan_topic_   = get_parameter("scan_topic").as_string();
+  output_dir_   = get_parameter("output_dir").as_string();
+  joint_name_   = get_parameter("joint_name").as_string();
   max_points_   = get_parameter("max_points").as_int();
   publish_rate_ = get_parameter("publish_rate").as_double();
 
@@ -39,21 +50,51 @@ ScanAssemblerNode::ScanAssemblerNode(const rclcpp::NodeOptions & options)
   // ── Pre-allocate circular buffer ──────────────────────────────────────────
   point_buffer_.resize(static_cast<std::size_t>(max_points_));
 
-  // ── Subscription ─────────────────────────────────────────────────────────
+  // ── Subscriptions ────────────────────────────────────────────────────────
   scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
     scan_topic_,
     rclcpp::SensorDataQoS(),
     std::bind(&ScanAssemblerNode::scan_callback, this, std::placeholders::_1));
 
-  // ── Publisher ─────────────────────────────────────────────────────────────
+  // Gantry bridge — converts /current_position (Float32, mm) → /joint_states (m)
+  // so robot_state_publisher keeps the TF tree in sync with the real encoder.
+  position_sub_ = create_subscription<std_msgs::msg::Float32>(
+    "/current_position", 10,
+    std::bind(&ScanAssemblerNode::position_callback, this, std::placeholders::_1));
+
+  // ── Publishers ─────────────────────────────────────────────────────────
   cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
     "/scanner/assembled_cloud", rclcpp::SensorDataQoS());
+
+  scan_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+    "/scanner/scan_cloud", rclcpp::SensorDataQoS());
+
+  joint_pub_ = create_publisher<sensor_msgs::msg::JointState>("/joint_states", 10);
+
+  // Latched Bool topic so cloud_colorizer_node always knows the current state
+  // even if it starts after scan_assembler_node.
+  scanning_pub_ = create_publisher<std_msgs::msg::Bool>(
+    "/scanner/is_scanning",
+    rclcpp::QoS(1).transient_local());
 
   // ── Clear service ─────────────────────────────────────────────────────────
   clear_srv_ = create_service<std_srvs::srv::Trigger>(
     "/scanner/clear_cloud",
     std::bind(
       &ScanAssemblerNode::clear_callback, this,
+      std::placeholders::_1, std::placeholders::_2));
+
+  // ── Start / Stop services ──────────────────────────────────────────────────
+  start_srv_ = create_service<std_srvs::srv::Trigger>(
+    "/scanner/start",
+    std::bind(
+      &ScanAssemblerNode::start_callback, this,
+      std::placeholders::_1, std::placeholders::_2));
+
+  stop_srv_ = create_service<std_srvs::srv::Trigger>(
+    "/scanner/stop",
+    std::bind(
+      &ScanAssemblerNode::stop_callback, this,
       std::placeholders::_1, std::placeholders::_2));
 
   // ── Publish timer ─────────────────────────────────────────────────────────
@@ -64,8 +105,25 @@ ScanAssemblerNode::ScanAssemblerNode(const rclcpp::NodeOptions & options)
 
   RCLCPP_INFO(
     get_logger(),
-    "scan_assembler_node: '%s' → '%s', max_points=%d, rate=%.1f Hz",
-    scan_topic_.c_str(), target_frame_.c_str(), max_points_, publish_rate_);
+    "scan_assembler_node: '%s' → '%s', joint='%s', max_points=%d, rate=%.1f Hz, output_dir='%s'",
+    scan_topic_.c_str(), target_frame_.c_str(), joint_name_.c_str(),
+    max_points_, publish_rate_, output_dir_.c_str());
+}
+
+// ── position_callback ───────────────────────────────────────────────────────
+// Converts /current_position (mm) → /joint_states (m).
+// robot_state_publisher consumes /joint_states to animate gantry_joint,
+// which is the dynamic edge in the TF tree that gives each scan ring its
+// correct 3-D position in base_link space.
+
+void ScanAssemblerNode::position_callback(
+  std_msgs::msg::Float32::ConstSharedPtr msg)
+{
+  sensor_msgs::msg::JointState js;
+  js.header.stamp = now();
+  js.name         = {joint_name_};
+  js.position     = {static_cast<double>(msg->data) / 1000.0};   // mm → m
+  joint_pub_->publish(js);
 }
 
 // ── scan_callback ──────────────────────────────────────────────────────────
@@ -73,6 +131,12 @@ ScanAssemblerNode::ScanAssemblerNode(const rclcpp::NodeOptions & options)
 void ScanAssemblerNode::scan_callback(
   sensor_msgs::msg::LaserScan::ConstSharedPtr msg)
 {
+  // Guard: discard scans when the scanner is not actively running.
+  // is_scanning_ is std::atomic<bool>, so this check is lock-free.
+  if (!is_scanning_) {
+    return;
+  }
+
   // Step 1: project 2D scan into a PointCloud2 in the scan's own frame.
   // projectLaser never needs TF — it always succeeds immediately.
   sensor_msgs::msg::PointCloud2 cloud_laser;
@@ -100,6 +164,11 @@ void ScanAssemblerNode::scan_callback(
   // Step 3: apply the transform to move the cloud into target_frame.
   sensor_msgs::msg::PointCloud2 cloud_out;
   tf2::doTransform(cloud_laser, cloud_out, tf_stamped);
+  cloud_out.header.stamp = msg->header.stamp;
+  cloud_out.header.frame_id = target_frame_;
+
+  // Publish the per-scan cloud for colorization (one ring at a time).
+  scan_cloud_pub_->publish(cloud_out);
 
   std::lock_guard<std::mutex> lock(buffer_mutex_);
   append_cloud(cloud_out);
@@ -174,6 +243,15 @@ void ScanAssemblerNode::publish_callback()
   cloud_pub_->publish(out_msg);
 }
 
+// ── clear_buffer_locked ────────────────────────────────────────────────────
+// Internal helper — caller MUST hold buffer_mutex_.
+
+void ScanAssemblerNode::clear_buffer_locked()
+{
+  write_index_  = 0;
+  active_count_ = 0;
+}
+
 // ── clear_callback ─────────────────────────────────────────────────────────
 
 void ScanAssemblerNode::clear_callback(
@@ -181,11 +259,145 @@ void ScanAssemblerNode::clear_callback(
   std::shared_ptr<std_srvs::srv::Trigger::Response> response)
 {
   std::lock_guard<std::mutex> lock(buffer_mutex_);
-  write_index_  = 0;
-  active_count_ = 0;
+  clear_buffer_locked();
   response->success = true;
   response->message = "Assembled cloud cleared";
   RCLCPP_INFO(get_logger(), "Assembled cloud cleared");
+}
+
+// ── start_callback ─────────────────────────────────────────────────────────
+// Clears the accumulation buffer first, then opens the gate so that every
+// new scan session always starts with a completely empty 3-D space.
+
+void ScanAssemblerNode::start_callback(
+  std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+  std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+  {
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    clear_buffer_locked();
+  }
+  is_scanning_ = true;
+  {
+    std_msgs::msg::Bool msg;
+    msg.data = true;
+    scanning_pub_->publish(msg);
+  }
+  response->success = true;
+  response->message = "Scanner started; accumulation buffer cleared";
+  RCLCPP_INFO(get_logger(), "Scan started — buffer cleared, accumulation active");
+}
+
+// ── save_pcd_locked ────────────────────────────────────────────────────────
+// Caller MUST hold buffer_mutex_.
+
+void ScanAssemblerNode::save_pcd_locked(const std::string & filepath)
+{
+  pcl::PointCloud<pcl::PointXYZ> pcl_cloud;
+  pcl_cloud.reserve(active_count_);
+
+  const std::size_t capacity = static_cast<std::size_t>(max_points_);
+
+  if (active_count_ < capacity) {
+    // Buffer not yet full — points are contiguous from index 0
+    for (std::size_t i = 0; i < active_count_; ++i) {
+      pcl_cloud.emplace_back(
+        point_buffer_[i].x, point_buffer_[i].y, point_buffer_[i].z);
+    }
+  } else {
+    // Buffer full/wrapped — oldest point is at write_index_
+    for (std::size_t k = 0; k < capacity; ++k) {
+      const std::size_t idx = (write_index_ + k) % capacity;
+      pcl_cloud.emplace_back(
+        point_buffer_[idx].x, point_buffer_[idx].y, point_buffer_[idx].z);
+    }
+  }
+
+  pcl_cloud.width    = static_cast<std::uint32_t>(pcl_cloud.size());
+  pcl_cloud.height   = 1;
+  pcl_cloud.is_dense = true;
+
+  if (pcl::io::savePCDFileBinary(filepath, pcl_cloud) != 0) {
+    throw std::runtime_error("pcl::io::savePCDFileBinary failed for: " + filepath);
+  }
+}
+
+// ── stop_callback ──────────────────────────────────────────────────────────
+
+void ScanAssemblerNode::stop_callback(
+  std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+  std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+  is_scanning_ = false;
+
+  // ── Build timestamped output path ─────────────────────────────────────────
+  const auto now_tp = std::chrono::system_clock::now();
+  const auto now_tt = std::chrono::system_clock::to_time_t(now_tp);
+  std::tm tm_buf{};
+  localtime_r(&now_tt, &tm_buf);
+  char time_str[32];
+  std::strftime(time_str, sizeof(time_str), "%Y%m%d_%H%M%S", &tm_buf);
+
+  std::error_code ec;
+  std::filesystem::create_directories(output_dir_, ec);
+  if (ec) {
+    const std::string msg =
+      "Scanner stopped but could not create output dir '" +
+      output_dir_ + "': " + ec.message();
+    response->success = false;
+    response->message = msg;
+    RCLCPP_ERROR(get_logger(), "%s", msg.c_str());
+    return;
+  }
+
+  const std::string filepath =
+    (std::filesystem::path(output_dir_) /
+     ("scan_" + std::string(time_str) + ".pcd")).string();
+
+  // ── Serialise buffer and write to disk (under lock) ───────────────────────
+  std::size_t saved_count = 0;
+  std::string save_error;
+
+  {
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    saved_count = active_count_;
+    if (saved_count > 0) {
+      try {
+        save_pcd_locked(filepath);
+      } catch (const std::exception & ex) {
+        save_error = ex.what();
+      }
+    }
+  }
+
+  // Notify cloud_colorizer_node (and any other listeners) that scanning stopped.
+  // Publish before filling in the response so the colorizer starts saving in
+  // parallel while we finish composing the service reply.
+  {
+    std_msgs::msg::Bool msg;
+    msg.data = false;
+    scanning_pub_->publish(msg);
+  }
+
+  if (saved_count == 0) {
+    response->success = true;
+    response->message = "Scanner stopped; buffer was empty — no .pcd written";
+    RCLCPP_WARN(get_logger(), "Scan stopped — buffer is empty, no .pcd written");
+  } else if (!save_error.empty()) {
+    response->success = false;
+    response->message = "Scanner stopped but failed to save PCD: " + save_error;
+    RCLCPP_ERROR(
+      get_logger(), "Scan stopped — failed to write '%s': %s",
+      filepath.c_str(), save_error.c_str());
+  } else {
+    response->success = true;
+    response->message =
+      "Scanner stopped; " + std::to_string(saved_count) +
+      " points saved to " + filepath;
+    RCLCPP_INFO(
+      get_logger(), "Scan stopped — %zu points saved → %s",
+      saved_count, filepath.c_str());
+  }
 }
 
 }  // namespace lidar_camera_fusion

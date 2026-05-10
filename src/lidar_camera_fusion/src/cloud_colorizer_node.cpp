@@ -1,10 +1,16 @@
 #include "lidar_camera_fusion/cloud_colorizer_node.hpp"
 
+#include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <ctime>
+#include <filesystem>
 #include <functional>
+#include <stdexcept>
 
 #include <opencv2/core.hpp>
 
+#include <pcl/io/pcd_io.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
@@ -21,10 +27,12 @@ CloudColorizerNode::CloudColorizerNode(const rclcpp::NodeOptions & options)
 {
   // ── Parameters ────────────────────────────────────────────────────────────
   declare_parameter("optical_frame",    "camera_optical_frame");
+  declare_parameter("output_dir",       ".");
   declare_parameter("queue_size",       10);
   declare_parameter("approx_time_slop", 0.1);
 
   optical_frame_     = get_parameter("optical_frame").as_string();
+  output_dir_        = get_parameter("output_dir").as_string();
   queue_size_        = get_parameter("queue_size").as_int();
   approx_time_slop_  = get_parameter("approx_time_slop").as_double();
 
@@ -36,7 +44,7 @@ CloudColorizerNode::CloudColorizerNode(const rclcpp::NodeOptions & options)
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_, this, true);
 
   // ── message_filters subscriptions ─────────────────────────────────────────
-  cloud_sub_.subscribe(this, "/scanner/assembled_cloud", rmw_qos_profile_sensor_data);
+  cloud_sub_.subscribe(this, "/scanner/scan_cloud", rmw_qos_profile_sensor_data);
   image_sub_.subscribe(this, "/image_raw",               rmw_qos_profile_sensor_data);
   info_sub_ .subscribe(this, "/camera_info",             rmw_qos_profile_default);
 
@@ -49,14 +57,24 @@ CloudColorizerNode::CloudColorizerNode(const rclcpp::NodeOptions & options)
       &CloudColorizerNode::sync_callback, this,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 
-  // ── Publisher ─────────────────────────────────────────────────────────────
+  // ── Publisher ─────────────────────────────────────────────────────────
   colored_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
     "/scanner/colored_cloud", rclcpp::SensorDataQoS());
 
+  // ── Scanning-state subscriber ────────────────────────────────────────
+  // Receives true (start) / false (stop) from scan_assembler_node.
+  // transient_local matches the publisher so a late-starting colorizer
+  // immediately gets the current scanning state.
+  is_scanning_sub_ = create_subscription<std_msgs::msg::Bool>(
+    "/scanner/is_scanning",
+    rclcpp::QoS(1).transient_local(),
+    std::bind(&CloudColorizerNode::is_scanning_callback, this,
+              std::placeholders::_1));
+
   RCLCPP_INFO(
     get_logger(),
-    "cloud_colorizer_node: projecting onto '%s', slop=%.2f s, queue=%d",
-    optical_frame_.c_str(), approx_time_slop_, queue_size_);
+    "cloud_colorizer_node: projecting onto '%s', slop=%.2f s, queue=%d, output_dir='%s'",
+    optical_frame_.c_str(), approx_time_slop_, queue_size_, output_dir_.c_str());
 }
 
 // ── sync_callback ──────────────────────────────────────────────────────────
@@ -66,14 +84,23 @@ void CloudColorizerNode::sync_callback(
   sensor_msgs::msg::Image::ConstSharedPtr        image_msg,
   sensor_msgs::msg::CameraInfo::ConstSharedPtr   info_msg)
 {
-  // ── 1. TF lookup: cloud frame → optical frame at image timestamp ──────────
+  // ── 1. TF lookup: cloud frame → optical frame (latest available) ───────────
+  // We use rclcpp::Time(0) — "give me the latest transform you have" — instead
+  // of the exact image timestamp.  The reason: the assembled cloud is already
+  // committed to base_link coordinates at publish time; there is no per-point
+  // timestamp that needs microsecond alignment with the image.  The gantry
+  // moves at mm/s, so the latest available camera pose (typically < 5 ms old)
+  // introduces negligible positional error (< 0.01 mm).  Using the image
+  // timestamp instead requires the dynamic base_link→gantry_link TF edge to
+  // have data that *brackets* the image stamp, which intermittently fails when
+  // the encoder publish rate creates a tiny gap just after the image arrives.
   geometry_msgs::msg::TransformStamped tf_stamped;
   try {
     tf_stamped = tf_buffer_->lookupTransform(
       optical_frame_,
       cloud_msg->header.frame_id,
-      rclcpp::Time(image_msg->header.stamp),
-      rclcpp::Duration(0, 100'000'000));  // 100 ms timeout for TF latency
+      rclcpp::Time(0),                    // latest available — no extrapolation
+      rclcpp::Duration(0, 100'000'000));  // 100 ms wait if TF tree not yet ready
   } catch (const tf2::TransformException & ex) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 2000,
@@ -154,13 +181,112 @@ void CloudColorizerNode::sync_callback(
     colored_cloud.push_back(pt);
   }
 
-  // ── 6. Serialize and publish ──────────────────────────────────────────────
+  colored_cloud.width = static_cast<std::uint32_t>(colored_cloud.size());
+  colored_cloud.height = 1;
+  colored_cloud.is_dense = false;
+
+  if (colored_cloud.empty()) {
+    return;
+  }
+
+  // ── 6. Append to cache and publish the full colored cloud ─────────────────
   sensor_msgs::msg::PointCloud2 out_msg;
-  pcl::toROSMsg(colored_cloud, out_msg);
+  {
+    std::lock_guard<std::mutex> lock(cloud_cache_mutex_);
+    if (!has_cloud_cache_) {
+      cloud_cache_ = colored_cloud;
+      has_cloud_cache_ = true;
+    } else {
+      cloud_cache_.points.reserve(cloud_cache_.points.size() + colored_cloud.points.size());
+      cloud_cache_.points.insert(
+        cloud_cache_.points.end(),
+        colored_cloud.points.begin(),
+        colored_cloud.points.end());
+      cloud_cache_.width = static_cast<std::uint32_t>(cloud_cache_.points.size());
+      cloud_cache_.height = 1;
+      cloud_cache_.is_dense = false;
+    }
+    pcl::toROSMsg(cloud_cache_, out_msg);
+  }
+
   out_msg.header.stamp    = image_msg->header.stamp;
   out_msg.header.frame_id = cloud_msg->header.frame_id;  // preserve original frame
 
   colored_pub_->publish(out_msg);
+}
+
+// ── is_scanning_callback ────────────────────────────────────────────────────────
+
+void CloudColorizerNode::is_scanning_callback(
+  std_msgs::msg::Bool::ConstSharedPtr msg)
+{
+  if (msg->data) {
+    // Scan started — discard any cloud from the previous session so we
+    // never accidentally save stale data.
+    std::lock_guard<std::mutex> lock(cloud_cache_mutex_);
+    cloud_cache_.clear();
+    cloud_cache_.width = 0;
+    cloud_cache_.height = 1;
+    cloud_cache_.is_dense = false;
+    has_cloud_cache_ = false;
+    RCLCPP_INFO(get_logger(), "Scan started — colored-cloud cache cleared");
+    return;
+  }
+
+  // Scan stopped — save the cached colored cloud to disk.
+  const auto now_tp = std::chrono::system_clock::now();
+  const auto now_tt = std::chrono::system_clock::to_time_t(now_tp);
+  std::tm tm_buf{};
+  localtime_r(&now_tt, &tm_buf);
+  char time_str[32];
+  std::strftime(time_str, sizeof(time_str), "%Y%m%d_%H%M%S", &tm_buf);
+
+  std::error_code ec;
+  std::filesystem::create_directories(output_dir_, ec);
+  if (ec) {
+    RCLCPP_ERROR(
+      get_logger(), "Cannot create output dir '%s': %s",
+      output_dir_.c_str(), ec.message().c_str());
+    return;
+  }
+
+  const std::string filepath =
+    (std::filesystem::path(output_dir_) /
+     ("colored_" + std::string(time_str) + ".pcd")).string();
+
+  std::size_t point_count = 0;
+  std::string save_error;
+
+  {
+    std::lock_guard<std::mutex> lock(cloud_cache_mutex_);
+
+    if (!has_cloud_cache_ || cloud_cache_.empty()) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Scan stopped but colored-cloud cache is empty — "
+        "is the camera connected and cloud_colorizer_node running?");
+      return;
+    }
+
+    point_count = cloud_cache_.size();
+    try {
+      if (pcl::io::savePCDFileBinary(filepath, cloud_cache_) != 0) {
+        throw std::runtime_error("savePCDFileBinary returned non-zero");
+      }
+    } catch (const std::exception & ex) {
+      save_error = ex.what();
+    }
+  }
+
+  if (!save_error.empty()) {
+    RCLCPP_ERROR(
+      get_logger(), "Failed to save colored PCD '%s': %s",
+      filepath.c_str(), save_error.c_str());
+  } else {
+    RCLCPP_INFO(
+      get_logger(), "Scan stopped — %zu colored points saved → %s",
+      point_count, filepath.c_str());
+  }
 }
 
 }  // namespace lidar_camera_fusion
