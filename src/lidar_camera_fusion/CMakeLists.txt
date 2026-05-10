@@ -114,6 +114,10 @@ install(DIRECTORY launch/
   DESTINATION share/${PROJECT_NAME}/launch
 )
 
+install(DIRECTORY urdf/
+  DESTINATION share/${PROJECT_NAME}/urdf
+)
+
 # ─── ament finalization ──────────────────────────────────────────────────────
 ament_export_include_directories(include)
 ament_export_dependencies(

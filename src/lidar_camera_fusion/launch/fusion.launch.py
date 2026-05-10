@@ -2,6 +2,7 @@
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -36,6 +37,14 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'scan_source_frame', default_value='laser',
             description='frame_id that rplidar publishes LaserScan in'),
+        DeclareLaunchArgument(
+            'output_dir', default_value='.',
+            description='Directory where timestamped .pcd files are saved on /scanner/stop'),
+        DeclareLaunchArgument(
+            'add_lidar_static_tf', default_value='true',
+            description='Publish a static identity TF from lidar_link to scan_source_frame. '
+                        'Set to false when scan_source_frame is already a link in the '
+                        'URDF TF tree (e.g. lidar_link) to avoid a self-transform error.'),
     ]
 
     scan_source_frame = LaunchConfiguration('scan_source_frame')
@@ -59,6 +68,7 @@ def generate_launch_description():
             '--child-frame-id', scan_source_frame,
         ],
         output='screen',
+        condition=IfCondition(LaunchConfiguration('add_lidar_static_tf')),
     )
 
     # ── scan_assembler_node ─────────────────────────────────────────────────
@@ -71,6 +81,7 @@ def generate_launch_description():
             'scan_topic':   LaunchConfiguration('scan_topic'),
             'max_points':   LaunchConfiguration('max_points'),
             'publish_rate': LaunchConfiguration('publish_rate'),
+            'output_dir':   LaunchConfiguration('output_dir'),
         }],
         output='screen',
     )
@@ -84,6 +95,7 @@ def generate_launch_description():
             'optical_frame':    LaunchConfiguration('optical_frame'),
             'queue_size':       LaunchConfiguration('queue_size'),
             'approx_time_slop': LaunchConfiguration('approx_time_slop'),
+            'output_dir':       LaunchConfiguration('output_dir'),
         }],
         output='screen',
     )
