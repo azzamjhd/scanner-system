@@ -1,18 +1,28 @@
 # scanner_system.repos
 # vcs import file for the massage scanning system.
 #
-# Usage:
-#   git clone https://github.com/azzamjhd/scanner-system.git ~/scanner_ws
+# Usage (not needed if you use bootstrap.sh which does this automatically):
 #   cd ~/scanner_ws
 #   vcs import src < scanner_system.repos
-#   ./bootstrap.sh
 #
-# After bootstrap, build:
-#   colcon build --symlink-install
+# === What the monorepo IS the source for ===
+# The scanner_system repo at https://github.com/azzamjhd/scanner-system.git
+# IS the workspace root. It ships all 6 custom packages:
+#   - lidar_camera_fusion   (full_system launch, fusion pipeline, segmentation)
+#   - medical_scanner_pkg   (legacy scanner node + mission-control GUI)
+#   - gantry_image_stitcher (distance-triggered image capture + stitching)
+#   - massage_perception    (MediaPipe pose landmarks -> massage points)
+#   - massage_points        (PCL point cloud flattening + bodypix segmentation)
+#   - massage_path_tool     (PyQt6 interactive path authoring tool)
+#
+# === What this .repos file adds ===
+# Only rplidar_ros — the external RPLiDAR driver from Slamtec.
 
 repositories:
 
   # ── RPLiDAR A1 driver (Slamtec upstream, ros2 branch) ───────────────────
+  # Published topics: /scan (sensor_msgs/LaserScan, frame_id=lidar_link)
+  # Used by: full_system.launch.py -> fusion.launch.py -> scan_assembler_node
   rplidar_ros:
     type: git
     url: https://github.com/Slamtec/rplidar_ros.git

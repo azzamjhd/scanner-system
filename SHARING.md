@@ -10,7 +10,7 @@
 
 ```bash
 # 1. Clone the workspace (it IS the source tree)
-git clone https://github.com/YOUR_USERNAME/scanner_system.git ~/scanner_ws
+git clone https://github.com/azzamjhd/scanner-system.git ~/scanner_ws
 cd ~/scanner_ws
 
 # 2. One command to pull external deps, install everything, and build
@@ -39,7 +39,6 @@ ros2 launch lidar_camera_fusion full_system.launch.py
 | `medical_scanner_pkg` | Python | Original scanner node + PyQt5 mission-control GUI |
 | `gantry_image_stitcher` | Python | Distance-triggered camera frame capture + OpenCV stitching |
 | `massage_perception` | Python | MediaPipe BlazePose landmark detection → massage points |
-| `massage_points` | C++ | Point cloud flattening + body-part segmentation |
 | `massage_path_tool` | Python | PyQt6 interactive massage path/path authoring tool |
 | `rplidar_ros` | C++ | Slamtec RPLiDAR A1 driver (patched, ros2 branch) |
 

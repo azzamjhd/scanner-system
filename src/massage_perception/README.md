@@ -26,8 +26,18 @@ Install common dependencies:
 ```bash
 sudo apt update
 sudo apt install -y ros-$ROS_DISTRO-cv-bridge ros-$ROS_DISTRO-v4l2-camera python3-pip
-pip3 install --user mediapipe opencv-python pyyaml
 ```
+
+> **⚠️ Important:** MediaPipe requires `numpy<2`. Ubuntu 24.04 ships with numpy 2.x.
+> Use the bootstrap script or install into an isolated venv:
+> ```bash
+> python3 -m venv ~/.scanner_venv
+> ~/.scanner_venv/bin/pip install "numpy<2" mediapipe opencv-python pyyaml
+> ```
+> Then activate the venv before running `pose_node`:
+> ```bash
+> source ~/.scanner_venv/bin/activate
+> ```
 
 > `ament_index_python` is typically available with ROS 2 Python installations.
 
@@ -152,10 +162,16 @@ Then run `pose_node` in another terminal.
 ## 8. Troubleshooting
 
 ### `ModuleNotFoundError` for `mediapipe`, `cv2`, or `yaml`
-Install missing Python dependencies:
+MediaPipe requires `numpy<2`. If you see import errors, activate the venv:
 
 ```bash
-pip3 install --user mediapipe opencv-python pyyaml
+source ~/.scanner_venv/bin/activate
+```
+
+If the venv doesn't exist yet, create it:
+```bash
+python3 -m venv ~/.scanner_venv
+~/.scanner_venv/bin/pip install "numpy<2" mediapipe opencv-python pyyaml
 ```
 
 ### No output on `pose_landmarks` / `massage_points`

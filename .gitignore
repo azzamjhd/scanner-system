@@ -2,7 +2,9 @@
 build/
 install/
 log/
-*/massage_points/
+
+# Heavy experiment (not part of the system)
+src/massage_points/
 
 # Python
 __pycache__/

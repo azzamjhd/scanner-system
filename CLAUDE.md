@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cd ~/Documents/ros2_ws
-source /opt/ros/humble/setup.bash
+source /opt/ros/jazzy/setup.bash
 
 # Build all custom packages (rplidar_ros is excluded via .gitignore; it builds separately if present)
 colcon build --symlink-install

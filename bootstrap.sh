@@ -4,7 +4,7 @@
 # REQUIRES: Ubuntu 24.04 (Noble), internet access.
 #
 # Quick start:
-#   git clone https://github.com/YOUR_USERNAME/scanner_system.git ~/scanner_ws
+#   git clone https://github.com/azzamjhd/scanner-system.git ~/scanner_ws
 #   cd ~/scanner_ws && ./bootstrap.sh
 #
 set -euo pipefail
