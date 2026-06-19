@@ -37,7 +37,7 @@ from rcl_interfaces.srv import (
     ListParameters,
     SetParameters,
 )
-from sensor_msgs.msg import Image, LaserScan
+from sensor_msgs.msg import Image, LaserScan, PointCloud2
 from std_msgs.msg import Bool, Float32
 from std_srvs.srv import Trigger
 import tf2_ros
@@ -118,11 +118,13 @@ class _Heartbeats:
 class FusionGuiNode(Node):
     """All ROS 2 entities live here. Spins in a background thread."""
 
-    SCAN_TOPIC          = "/scan"
-    POSITION_TOPIC      = "/current_position"
-    IMAGE_TOPIC         = "/image_raw"
-    IS_SCANNING_TOPIC   = "/scanner/is_scanning"
-    ROSOUT_TOPIC        = "/rosout"
+    SCAN_TOPIC             = "/scan"
+    POSITION_TOPIC         = "/current_position"
+    IMAGE_TOPIC            = "/image_raw"
+    IS_SCANNING_TOPIC      = "/scanner/is_scanning"
+    ASSEMBLED_CLOUD_TOPIC  = "/scanner/assembled_cloud"
+    COLORED_CLOUD_TOPIC    = "/scanner/colored_cloud"
+    ROSOUT_TOPIC           = "/rosout"
 
     POSITION_PUB_TOPIC  = "/position"
     SPEED_PUB_TOPIC     = "/speed"
@@ -134,10 +136,11 @@ class FusionGuiNode(Node):
     TF_TARGET   = "base_link"
     TF_SOURCE   = "lidar_link"
 
-    # nodes whose health we monitor in the status panel
+    # nodes whose health we monitor in the status panel and param auto-discover
     MONITORED_NODES = (
         "scan_assembler_node",
         "cloud_colorizer_node",
+        "scan_image_recorder_node",
         "robot_state_publisher",
         "v4l2_camera_node",
     )
@@ -173,6 +176,12 @@ class FusionGuiNode(Node):
         self.create_subscription(
             Image, self.IMAGE_TOPIC,
             self._on_image, sensor_qos, callback_group=self.cb_group)
+        self.create_subscription(
+            PointCloud2, self.ASSEMBLED_CLOUD_TOPIC,
+            self._on_assembled_cloud, sensor_qos, callback_group=self.cb_group)
+        self.create_subscription(
+            PointCloud2, self.COLORED_CLOUD_TOPIC,
+            self._on_colored_cloud, sensor_qos, callback_group=self.cb_group)
 
         # transient_local matches scan_assembler's publisher
         latched_qos = QoSProfile(
@@ -225,6 +234,12 @@ class FusionGuiNode(Node):
     def _on_image(self, _msg: Image) -> None:
         self.heartbeats.touch(self.IMAGE_TOPIC)
         self.bridge.image_heartbeat.emit()
+
+    def _on_assembled_cloud(self, _msg: PointCloud2) -> None:
+        self.heartbeats.touch(self.ASSEMBLED_CLOUD_TOPIC)
+
+    def _on_colored_cloud(self, _msg: PointCloud2) -> None:
+        self.heartbeats.touch(self.COLORED_CLOUD_TOPIC)
 
     def _on_is_scanning(self, msg: Bool) -> None:
         self.bridge.is_scanning_changed.emit(bool(msg.data))

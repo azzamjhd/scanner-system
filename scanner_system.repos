@@ -1,0 +1,19 @@
+# scanner_system.repos
+# vcs import file for the massage scanning system.
+#
+# Usage:
+#   git clone https://github.com/azzamjhd/scanner-system.git ~/scanner_ws
+#   cd ~/scanner_ws
+#   vcs import src < scanner_system.repos
+#   ./bootstrap.sh
+#
+# After bootstrap, build:
+#   colcon build --symlink-install
+
+repositories:
+
+  # ── RPLiDAR A1 driver (Slamtec upstream, ros2 branch) ───────────────────
+  rplidar_ros:
+    type: git
+    url: https://github.com/Slamtec/rplidar_ros.git
+    version: ros2

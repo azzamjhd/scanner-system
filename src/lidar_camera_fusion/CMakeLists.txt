@@ -11,6 +11,7 @@ endif()
 
 # ─── ROS2 ament packages ────────────────────────────────────────────────────
 find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -27,7 +28,17 @@ find_package(cv_bridge REQUIRED)
 find_package(message_filters REQUIRED)
 
 # ─── System libraries ───────────────────────────────────────────────────────
-find_package(PCL REQUIRED COMPONENTS common io)
+# body_preprocess_node needs filters / segmentation / search / kdtree on top
+# of the common+io that the other nodes already use.
+find_package(PCL REQUIRED COMPONENTS
+  common
+  io
+  filters
+  segmentation
+  sample_consensus
+  search
+  kdtree
+)
 find_package(OpenCV REQUIRED)
 
 # ─── scan_assembler_node ────────────────────────────────────────────────────
@@ -99,11 +110,49 @@ target_link_libraries(cloud_colorizer_node
   ${OpenCV_LIBS}
 )
 
+# ─── body_preprocess_node ───────────────────────────────────────────────────
+# RANSAC bed-plane removal + Euclidean clustering; reads /scanner/colored_cloud
+# and publishes /scanner/body_cloud.
+add_executable(body_preprocess_node
+  src/body_preprocess_node.cpp
+)
+
+target_include_directories(body_preprocess_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${PCL_INCLUDE_DIRS}
+)
+
+target_compile_definitions(body_preprocess_node PRIVATE
+  ${PCL_DEFINITIONS}
+)
+
+ament_target_dependencies(body_preprocess_node
+  rclcpp
+  sensor_msgs
+  std_msgs
+  pcl_conversions
+)
+
+target_link_libraries(body_preprocess_node
+  ${PCL_LIBRARIES}
+)
+
+# ─── Python module (fusion_gui, manual_segmentation_node) ───────────────────
+ament_python_install_package(${PROJECT_NAME})
+
 # ─── Install ────────────────────────────────────────────────────────────────
 install(TARGETS
   scan_assembler_node
   cloud_colorizer_node
+  body_preprocess_node
   RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+# Install the Python entry-point so `ros2 run lidar_camera_fusion fusion_gui` works
+install(PROGRAMS
+  scripts/fusion_gui
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 install(DIRECTORY include/
@@ -116,6 +165,14 @@ install(DIRECTORY launch/
 
 install(DIRECTORY urdf/
   DESTINATION share/${PROJECT_NAME}/urdf
+)
+
+# ─── Python scripts ─────────────────────────────────────────────────────────
+install(PROGRAMS
+  scripts/scan_image_recorder_node
+  scripts/manual_segmentation_node
+  scripts/scan_cycle_node
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 # ─── ament finalization ──────────────────────────────────────────────────────

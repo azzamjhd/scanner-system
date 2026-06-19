@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Console entrypoint installed via CMake (PROGRAMS) so that
+`ros2 run lidar_camera_fusion manual_segmentation_node` Just Works
+without needing to wire up an `entry_points` setup.py."""
+from lidar_camera_fusion.manual_segmentation_node import main
+
+if __name__ == "__main__":
+    main()

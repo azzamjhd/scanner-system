@@ -28,11 +28,15 @@ CloudColorizerNode::CloudColorizerNode(const rclcpp::NodeOptions & options)
   // ── Parameters ────────────────────────────────────────────────────────────
   declare_parameter("optical_frame",    "camera_optical_frame");
   declare_parameter("output_dir",       ".");
+  declare_parameter("image_topic",      "/image_rect_color");
+  declare_parameter("camera_info_topic", "/camera_info");
   declare_parameter("queue_size",       10);
   declare_parameter("approx_time_slop", 0.1);
 
   optical_frame_     = get_parameter("optical_frame").as_string();
   output_dir_        = get_parameter("output_dir").as_string();
+  image_topic_       = get_parameter("image_topic").as_string();
+  camera_info_topic_ = get_parameter("camera_info_topic").as_string();
   queue_size_        = get_parameter("queue_size").as_int();
   approx_time_slop_  = get_parameter("approx_time_slop").as_double();
 
@@ -45,8 +49,8 @@ CloudColorizerNode::CloudColorizerNode(const rclcpp::NodeOptions & options)
 
   // ── message_filters subscriptions ─────────────────────────────────────────
   cloud_sub_.subscribe(this, "/scanner/scan_cloud", rmw_qos_profile_sensor_data);
-  image_sub_.subscribe(this, "/image_raw",               rmw_qos_profile_sensor_data);
-  info_sub_ .subscribe(this, "/camera_info",             rmw_qos_profile_default);
+  image_sub_.subscribe(this, image_topic_,       rmw_qos_profile_sensor_data);
+  info_sub_ .subscribe(this, camera_info_topic_, rmw_qos_profile_default);
 
   sync_ = std::make_shared<Synchronizer>(
     SyncPolicy(static_cast<uint32_t>(queue_size_)),
@@ -73,8 +77,9 @@ CloudColorizerNode::CloudColorizerNode(const rclcpp::NodeOptions & options)
 
   RCLCPP_INFO(
     get_logger(),
-    "cloud_colorizer_node: projecting onto '%s', slop=%.2f s, queue=%d, output_dir='%s'",
-    optical_frame_.c_str(), approx_time_slop_, queue_size_, output_dir_.c_str());
+    "cloud_colorizer_node: image='%s', camera_info='%s', projecting onto '%s', slop=%.2f s, queue=%d, output_dir='%s'",
+    image_topic_.c_str(), camera_info_topic_.c_str(), optical_frame_.c_str(),
+    approx_time_slop_, queue_size_, output_dir_.c_str());
 }
 
 // ── sync_callback ──────────────────────────────────────────────────────────
@@ -125,12 +130,15 @@ void CloudColorizerNode::sync_callback(
   const int       img_w   = img.cols;
   const int       img_h   = img.rows;
 
-  // ── 4. Camera intrinsics from CameraInfo.k (row-major 3×3) ───────────────
-  // k = [fx, 0, cx, 0, fy, cy, 0, 0, 1]
-  const double fx = info_msg->k[0];
-  const double fy = info_msg->k[4];
-  const double cx = info_msg->k[2];
-  const double cy = info_msg->k[5];
+  // ── 4. Rectified camera intrinsics from CameraInfo.p (row-major 3×4) ─────
+  // Option A: colorize using image_proc's rectified image.  Projection must
+  // use the rectified projection matrix P, not raw K/D.  Do not apply D here;
+  // image_proc already removed lens distortion from the image coordinates.
+  // p = [fx, 0, cx, Tx, 0, fy, cy, Ty, 0, 0, 1, 0]
+  const double fx = info_msg->p[0];
+  const double fy = info_msg->p[5];
+  const double cx = info_msg->p[2];
+  const double cy = info_msg->p[6];
 
   // ── 5. Build colored PCL cloud ────────────────────────────────────────────
   const std::size_t n_pts = cloud_msg->width * cloud_msg->height;

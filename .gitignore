@@ -2,6 +2,7 @@
 build/
 install/
 log/
+*/massage_points/
 
 # Python
 __pycache__/
@@ -17,3 +18,28 @@ src/rplidar_ros/
 .vscode/
 .idea/
 .DS_Store
+
+# Tool/agent directories
+.commandcode/
+.gemini/
+.hermes/
+.claude/
+
+# Tool/agent config files
+CLAUDE.md
+GEMINI.md
+
+# Experimental / bridge
+ai_bridge/
+graphify-out/
+
+# Test data
+*.pcd
+*.ply
+
+# Local calibration
+webcam_calibration.yaml
+
+# Temp
+*/cache/*
+*.bak

@@ -115,6 +115,9 @@ class FusionMainWindow(QMainWindow):
 
         self._is_scanning = False
         self._latest_pos_mm: Optional[float] = None
+        # tracks which nodes were running on the last poll tick
+        # used to trigger auto-discovery when a node first comes online
+        self._prev_nodes_running: set = set()
 
         # ── Build layout ────────────────────────────────────────────────────
         central = QWidget()
@@ -161,6 +164,7 @@ class FusionMainWindow(QMainWindow):
         # discover params after the executor is up — give nodes a moment to publish
         QTimer.singleShot(800,  lambda: self._discover("scan_assembler_node"))
         QTimer.singleShot(1200, lambda: self._discover("cloud_colorizer_node"))
+        QTimer.singleShot(1600, lambda: self._discover("scan_image_recorder_node"))
 
     # ── Panel builders ──────────────────────────────────────────────────────
 
@@ -176,6 +180,7 @@ class FusionMainWindow(QMainWindow):
         self.row_camera    = _StatusRow(grid, 3, "v4l2_camera (/image_raw)")
         self.row_assembler = _StatusRow(grid, 4, "scan_assembler_node")
         self.row_colorizer = _StatusRow(grid, 5, "cloud_colorizer_node")
+        self.row_recorder  = _StatusRow(grid, 6, "scan_image_recorder_node")
 
         return box
 
@@ -263,7 +268,11 @@ class FusionMainWindow(QMainWindow):
         top = QHBoxLayout()
         top.addWidget(QLabel("Node:"))
         self.cmb_node = QComboBox()
-        self.cmb_node.addItems(["scan_assembler_node", "cloud_colorizer_node"])
+        self.cmb_node.addItems([
+            "scan_assembler_node",
+            "cloud_colorizer_node",
+            "scan_image_recorder_node",
+        ])
         self.cmb_node.currentTextChanged.connect(self._discover)
         top.addWidget(self.cmb_node, 1)
         self.btn_refresh = QToolButton()
@@ -352,16 +361,53 @@ class FusionMainWindow(QMainWindow):
                          "base_link → lidar_link OK" if tf_ok
                          else "TF not available")
 
-        # node-name based detection for assembler and colorizer
+        # node-name based detection — assembler, colorizer, recorder
         running = set(self.node.list_running_nodes())
-        for row, name in (
-            (self.row_assembler, "scan_assembler_node"),
-            (self.row_colorizer, "cloud_colorizer_node"),
-        ):
-            if name in running:
-                row.set("green", "running")
+
+        # assembler: also show assembled-cloud topic heartbeat
+        if "scan_assembler_node" in running:
+            cloud_age = self.node.heartbeat_age(self.node.ASSEMBLED_CLOUD_TOPIC)
+            if cloud_age is None:
+                detail = "running — cloud: no msgs yet"
             else:
-                row.set("red", "not running")
+                detail = f"running — cloud: {cloud_age:.1f}s ago"
+            self.row_assembler.set("green", detail)
+        else:
+            self.row_assembler.set("red", "not running")
+
+        # colorizer: show colored-cloud topic heartbeat
+        if "cloud_colorizer_node" in running:
+            col_age = self.node.heartbeat_age(self.node.COLORED_CLOUD_TOPIC)
+            if col_age is None:
+                detail = "running — colored cloud: no msgs yet"
+            else:
+                detail = f"running — colored: {col_age:.1f}s ago"
+            self.row_colorizer.set(self._classify(col_age), detail)
+        else:
+            self.row_colorizer.set("red", "not running")
+
+        # recorder: running / not running
+        if "scan_image_recorder_node" in running:
+            self.row_recorder.set("green", "running")
+        else:
+            self.row_recorder.set("red", "not running")
+
+        # ── Auto-discover params for nodes that just came online ────────────
+        newly_online = running - self._prev_nodes_running
+        if newly_online:
+            current_node = self.cmb_node.currentText()
+            # silently pre-discover all newly-online param nodes in the background
+            for name in newly_online:
+                if name in ("scan_assembler_node",
+                            "cloud_colorizer_node",
+                            "scan_image_recorder_node"):
+                    if name == current_node:
+                        # refresh the visible panel
+                        self._discover(name)
+                    else:
+                        # background-only (no UI update)
+                        self.node.discover_params(name)
+        self._prev_nodes_running = running
 
         # button enable/disable
         self.btn_start.setEnabled(
