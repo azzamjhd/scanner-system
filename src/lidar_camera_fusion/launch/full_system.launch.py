@@ -178,11 +178,11 @@ def generate_launch_description():
             description='Gantry start position (mm) for /scanner/start_cycle'),
         DeclareLaunchArgument(
             'scan_end_mm',
-            default_value='300.0',
+            default_value='1850.0',
             description='Gantry end position (mm) for /scanner/start_cycle'),
         DeclareLaunchArgument(
             'scan_speed_mm_s',
-            default_value='20.0',
+            default_value='30.0',
             description='Gantry speed (mm/s) during scan sweep'),
         DeclareLaunchArgument(
             'scan_tolerance_mm',

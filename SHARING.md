@@ -44,13 +44,25 @@ ros2 launch lidar_camera_fusion full_system.launch.py
 
 ## Running without hardware
 
-The scanner works in simulation mode for dev/testing:
+The `lidar_camera_fusion` pipeline needs position feedback to operate. Without
+an ESP32 encoder, publish synthetic position data:
 
 ```bash
-ros2 launch lidar_camera_fusion full_system.launch.py \
-  mcu_port:='' \
-  lidar_port:=/dev/null \
-  simulate_encoder:=true
+# Terminal 1: start the fusion pipeline (no camera)
+ros2 launch lidar_camera_fusion fusion.launch.py camera_device:=/dev/null
+
+# Terminal 2: publish simulated encoder feedback
+ros2 topic pub /current_position std_msgs/msg/Float32 "{data: 50}" -r 20
+```
+
+Adjust the position value and rate to simulate gantry motion. The scan
+assembler will accumulate a cloud as it receives dummy position updates.
+
+For the legacy `scanner_3d_node` (in `medical_scanner_pkg`), there is a
+built-in encoder simulator:
+
+```bash
+ros2 run medical_scanner_pkg scanner_3d_node --ros-args -p simulate_encoder:=true
 ```
 
 ## MediaPipe setup
