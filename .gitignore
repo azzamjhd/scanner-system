@@ -37,9 +37,6 @@ graphify-out/
 *.pcd
 *.ply
 
-# Local calibration
-webcam_calibration.yaml
-
 # Temp
 */cache/*
 *.bak
