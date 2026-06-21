@@ -2,7 +2,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 def make_empty_session(aspect_ratio=1.0, source_image=''):
     return {
@@ -17,6 +17,7 @@ def make_empty_session(aspect_ratio=1.0, source_image=''):
 def save_session(session, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    session['schema_version'] = SCHEMA_VERSION
     with open(path, 'w') as f:
         json.dump(session, f, indent=2)
 
