@@ -19,6 +19,7 @@ setup(
         'console_scripts': [
             'gui = massage_path_tool.main:main',
             'massage_path_translator = massage_path_tool.core.path_translator:main',
+            'marker_publisher_node = massage_path_tool.ros.marker_publisher_node:main',
         ],
     },
 )
