@@ -278,7 +278,8 @@ class MainWindow(QMainWindow):
         if not ok or not label:
             return
         self._session["discrete_points"].append(
-            {"id": label, "label": label, "u": u, "v": v}
+            {"id": label, "label": label, "u": u, "v": v,
+             "x_stitch": float(x), "y_stitch": float(y)}
         )
         self._canvas.add_point_item(x, y, label)
         self._update_status_counts()
@@ -302,7 +303,15 @@ class MainWindow(QMainWindow):
         self._session["paths"].append({
             "id": label,
             "label": label,
-            "points": [{"u": float(p[0]), "v": float(p[1])} for p in uvs],
+            "points": [
+                {
+                    "u": float(uvs[i, 0]),
+                    "v": float(uvs[i, 1]),
+                    "x_stitch": float(smoothed[i, 0]),
+                    "y_stitch": float(smoothed[i, 1]),
+                }
+                for i in range(len(uvs))
+            ],
         })
         self._canvas.add_path_item(smoothed)
         self._update_status_counts()
