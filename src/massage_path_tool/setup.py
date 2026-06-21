@@ -13,11 +13,12 @@ setup(
             ['resource/massage_path_tool']),
         ('share/massage_path_tool', ['package.xml']),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'open3d'],
     zip_safe=False,
     entry_points={
         'console_scripts': [
             'gui = massage_path_tool.main:main',
+            'massage_path_translator = massage_path_tool.core.path_translator:main',
         ],
     },
 )
