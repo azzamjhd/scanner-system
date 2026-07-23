@@ -12,6 +12,7 @@ __pycache__/
 *.pyo
 *.so
 .pytest_cache/
+*.venv/
 
 # Exclude rplidar_ros (managed separately)
 src/rplidar_ros/

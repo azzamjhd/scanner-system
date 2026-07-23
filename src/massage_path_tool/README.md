@@ -87,24 +87,24 @@ If the patient moves, the paths track their body. If the pose becomes invalid (e
           │                           │                        │
           └───────────────────────────┼────────────────────────┘
                                       │
-                                      ▼
+                                                               ▼
                          ┌──────────────────────────┐
-                         │  massage_path_translator  │
-                         │  (pure Python CLI, no ROS)│
+                         │ massage_path_translator  │
+                         │ (pure Python CLI, no ROS)│
                          └────────────┬─────────────┘
                                       │
-                                      ▼
+                                                               ▼
                          ┌──────────────────────────┐
                          │  trajectories_3d.json    │
                          │  (frame: base_link, m)   │
                          └────────────┬─────────────┘
                                       │
-                                      ▼
+                                                               ▼
                          ┌──────────────────────────────┐
                          │  marker_publisher_node       │
                          │  (optional ROS 2 node)       │
                          │  → MarkerArray on            │
-                         │    /massage_trajectories_3d   │
+                         │   /massage_trajectories_3d   │
                          └──────────────────────────────┘
 ```
 
@@ -485,6 +485,212 @@ ros2 run massage_path_tool marker_publisher_node \
 ```
 
 Then open RViz, add **MarkerArray** display, topic `/massage_trajectories_3d`, fixed frame `base_link`. Orange spheres = discrete points, cyan lines = paths.
+
+---
+
+## Current Scan-to-3D Workflow: Per-Scan Session + Per-Scan Alignment
+
+Each scan timestamp must use its own matching files. Do **not** mix a session or alignment from another scan.
+
+Example for scan `20260617_220116`:
+
+```text
+/home/azzam/Documents/ros2_scans/stitched_20260617_220116.png
+/home/azzam/Documents/ros2_scans/colored_20260617_220116.pcd
+/home/azzam/Documents/ros2_scans/massage_session_20260617_220116.json
+/home/azzam/Documents/ros2_scans/pcd_stitched_alignment_20260617_220116.json
+```
+
+### 1. Create the session for that exact stitched image
+
+```bash
+cd /home/azzam/Documents/ros2_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+ros2 run massage_path_tool gui \
+  --image /home/azzam/Documents/ros2_scans/stitched_20260617_220116.png \
+  --session /home/azzam/Documents/ros2_scans/massage_session_20260617_220116.json
+```
+
+In the GUI:
+
+1. Run MediaPipe/anchor detection.
+2. Check `left_shoulder`, `right_shoulder`, `right_hip`, `left_hip` visually.
+3. Save the session.
+
+The session stores massage points/paths plus body-relative `u/v` coordinates and GUI image coordinates.
+
+### 2. Reuse the latest verified PCD/stitch alignment
+
+Do **not** create a new alignment every run. Reuse the last verified alignment JSON unless the PCD/image relationship changed and you intentionally need to realign.
+
+Example existing alignment:
+
+```text
+/home/azzam/Documents/ros2_scans/pcd_stitched_alignment_20260617_124637.json
+```
+
+If you need to create or fix an alignment manually, run:
+
+```bash
+cd /home/azzam/Documents/ros2_ws/src/massage_path_tool
+
+python3 scripts/align_pcd_to_stitched.py \
+  --pcd /home/azzam/Documents/ros2_scans/colored_20260617_220116.pcd \
+  --image /home/azzam/Documents/ros2_scans/stitched_20260617_220116.png \
+  --out /home/azzam/Documents/ros2_scans/pcd_stitched_alignment_20260617_220116.json
+```
+
+Only save when the projected PCD colors line up with the stitched image body.
+
+### 3. Convert GUI session into stitched-image coordinates
+
+Current closest mode is `--mode uv`:
+
+```bash
+python3 scripts/convert_session_to_stitched.py \
+  --stitched /home/azzam/Documents/ros2_scans/stitched_20260617_220116.png \
+  --session /home/azzam/Documents/ros2_scans/massage_session_20260617_220116.json \
+  --out /home/azzam/Documents/ros2_scans/massage_session_stitched_20260617_220116.json \
+  --preview /home/azzam/Documents/ros2_scans/massage_session_stitched_overlay_preview_20260617_220116.png \
+  --mode uv
+```
+
+Preview output:
+
+```text
+/home/azzam/Documents/ros2_scans/massage_session_stitched_overlay_preview_20260617_220116.png
+```
+
+Check this image before generating 3D.
+
+### 4. Generate CloudCompare trajectories
+
+```bash
+python3 scripts/generate_aligned_trajectories.py \
+  --cloud /home/azzam/Documents/ros2_scans/colored_20260617_220116.pcd \
+  --alignment /home/azzam/Documents/ros2_scans/pcd_stitched_alignment_20260617_124637.json \
+  --session /home/azzam/Documents/ros2_scans/massage_session_stitched_20260617_220116.json \
+  --out-prefix /home/azzam/Documents/ros2_scans/aligned_trajectories_20260617_220116_uv \
+  --max-px 25
+```
+
+Open in CloudCompare:
+
+```text
+/home/azzam/Documents/ros2_scans/colored_20260617_220116.pcd
+/home/azzam/Documents/ros2_scans/aligned_trajectories_20260617_220116_uv.ply
+```
+
+### Coordinate fields in `massage_session_stitched_*.json`
+
+For each point:
+
+```json
+{
+  "id": "p1",
+  "label": "p1",
+  "u": 0.298,
+  "v": -0.013,
+  "x_stitch": 264.71,
+  "y_stitch": 512.94,
+  "x_gui": 154.10,
+  "y_gui": 194.39
+}
+```
+
+Meaning:
+
+| Field | Meaning |
+|---|---|
+| `id`, `label` | point/path identifier shown in the GUI |
+| `u` | body-relative left-to-right coordinate inside the shoulder/hip quad |
+| `v` | body-relative shoulder-to-hip coordinate inside the shoulder/hip quad |
+| `x_gui`, `y_gui` | original saved GUI coordinates before conversion; audit/debug only |
+| `x_stitch`, `y_stitch` | coordinates used by the 3D generator |
+
+Use `x_stitch/y_stitch` for 3D generation. Treat `x_gui/y_gui` as debug values only.
+
+### Current known problem
+
+The coordinate pipeline is still not fully reliable.
+
+Observed failure modes:
+
+1. **Wrong MediaPipe anchors**  
+   If `right_shoulder` or `right_hip` is misplaced, `--mode uv` warps all massage paths because it recomputes `x_stitch/y_stitch` from `u/v` plus the anchor quad.
+
+2. **Raw session coordinates can be too small/top-left**  
+   Using original `massage_session_*.json` `x_stitch/y_stitch` directly produced a small top-left trajectory, e.g. `x=[87..298]`, `y=[168..511]`. Those values are not necessarily final full stitched-image coordinates.
+
+3. **`--mode uv` must use the GUI homography model**  
+   The GUI documentation says UV projection is projective: `cv2.findHomography(unit_quad, anchor_quad)` followed by `cv2.perspectiveTransform`. A previous experimental converter used bilinear interpolation; that is not the same mathematical model and can shift paths on skewed anchor quads. Current `--mode uv` uses the homography model. The old bilinear behavior is available only as `--mode bilinear` for debugging.
+
+4. **Alignment JSON should be reused when it is already verified**  
+   Do not create a new alignment just because the wrapper runs. Use the last verified alignment JSON (for example `pcd_stitched_alignment_20260617_124637.json`) unless the PCD/stitch coordinate relationship changed and you intentionally realign.
+
+5. **Output is not anatomically guaranteed correct**  
+   The nearest projected-cloud pixel error can be low while the path is still anatomically shifted if anchors or PCD/image alignment are wrong. Always verify in the 2D preview and CloudCompare.
+
+### One-command wrapper
+
+For a matching `colored_*.pcd` + `stitched_*.png`, run:
+
+```bash
+cd /home/azzam/Documents/ros2_ws/src/massage_path_tool
+
+python3 scripts/auto_scan_to_trajectories.py \
+  --cloud /home/azzam/Documents/ros2_scans/colored_20260617_220116.pcd \
+  --stitched /home/azzam/Documents/ros2_scans/stitched_20260617_220116.png \
+  --template-session /home/azzam/Documents/ros2_ws/src/massage_path_tool/massage_session.json \
+  --alignment /home/azzam/Documents/ros2_scans/pcd_stitched_alignment_20260617_124637.json \
+  --mode uv
+```
+
+This creates:
+
+```text
+massage_session_20260617_220116.json
+pcd_stitched_alignment_20260617_220116.json
+massage_session_stitched_20260617_220116.json
+massage_session_stitched_overlay_preview_20260617_220116.png
+aligned_trajectories_20260617_220116_uv.pcd/.ply/.json
+```
+
+Notes:
+
+- `--template-session` supplies the existing authored massage paths/discrete points.
+- The script regenerates anchors from MediaPipe on the new stitched image.
+- Default behavior reuses the latest existing `pcd_stitched_alignment_*.json`; pass `--alignment PATH` when you know the exact verified alignment to use.
+- Use `--auto-align-colors` to auto-refine alignment by matching projected PCD colors/edges to the stitched image. It writes `pcd_stitched_alignment_<stamp>_auto_color.json` plus a preview PNG.
+- Add `--auto-align-try-flips` with `--auto-align-colors` if orientation may be flipped.
+- Use `--manual-align` only when you intentionally want to create/overwrite alignment.
+- Use `--auto-align` only for quick debug; it is an unverified initial fit.
+- If MediaPipe is not installed in the current Python environment, create the session with the GUI first, then rerun with `--skip-session`.
+
+### Debug commands
+
+Compare how far UV conversion moved points from original GUI coords:
+
+```bash
+python3 scripts/compare_gui_uv_offsets.py \
+  --session /home/azzam/Documents/ros2_scans/massage_session_stitched_20260617_220116.json
+```
+
+Generate using raw stored session coordinates only for diagnosis:
+
+```bash
+python3 scripts/generate_aligned_trajectories.py \
+  --cloud /home/azzam/Documents/ros2_scans/colored_20260617_220116.pcd \
+  --alignment /home/azzam/Documents/ros2_scans/pcd_stitched_alignment_20260617_124637.json \
+  --session /home/azzam/Documents/ros2_scans/massage_session_20260617_220116.json \
+  --use-raw-session-xy \
+  --out-prefix /home/azzam/Documents/ros2_scans/aligned_trajectories_20260617_220116_raw_debug \
+  --max-px 25
+```
+
+If raw output is small/top-left, use `--mode uv` conversion and inspect anchors.
 
 ---
 

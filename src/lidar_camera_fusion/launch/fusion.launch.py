@@ -17,6 +17,9 @@ def generate_launch_description():
             'scan_topic', default_value='/scan',
             description='LaserScan topic from the RPLiDAR A1'),
         DeclareLaunchArgument(
+            'position_topic', default_value='/current_position',
+            description='Gantry position feedback topic (geometry_msgs/Point; x is scan axis in mm)'),
+        DeclareLaunchArgument(
             'max_points', default_value='500000',
             description='Circular buffer capacity; oldest points are evicted first'),
         DeclareLaunchArgument(
@@ -155,8 +158,9 @@ def generate_launch_description():
         name='scan_assembler_node',
         parameters=[{
             'target_frame': LaunchConfiguration('target_frame'),
-            'scan_topic':   LaunchConfiguration('scan_topic'),
-            'max_points':   LaunchConfiguration('max_points'),
+            'scan_topic':      LaunchConfiguration('scan_topic'),
+            'position_topic':  LaunchConfiguration('position_topic'),
+            'max_points':      LaunchConfiguration('max_points'),
             'publish_rate': LaunchConfiguration('publish_rate'),
             'output_dir':   LaunchConfiguration('output_dir'),
         }],

@@ -14,8 +14,8 @@ Services (designed for Foxglove Call Service panels):
     /scanner/start_cycle  (std_srvs/Trigger) — run the sweep
     /scanner/interrupt    (std_srvs/Trigger) — cancel in-progress cycle
 
-Subscribes:  /current_position  (std_msgs/Float32, mm)
-Publishes:   /position          (std_msgs/Float32, mm)
+Subscribes:  configurable position_topic (geometry_msgs/Point, x mm)
+Publishes:   configurable target_position_topic (geometry_msgs/Point, x mm)
              /speed             (std_msgs/Float32, mm/s)
 
 Parameters (set in launch file or via ros2 param set):
@@ -35,6 +35,7 @@ import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from geometry_msgs.msg import Point
 from std_msgs.msg import Float32
 from std_srvs.srv import Trigger
 
@@ -51,8 +52,14 @@ class ScanCycleNode(Node):
         self.declare_parameter("speed_mm_s", 20.0)
         self.declare_parameter("tolerance_mm", 0.5)
         self.declare_parameter("timeout_s", 60.0)
+        self.declare_parameter("position_topic", "/current_position")
+        self.declare_parameter("target_position_topic", "/target_position")
+        self.declare_parameter("speed_topic", "/speed")
 
         # Read once at construction — use ros2 param set to change between cycles
+        self._position_topic = str(self.get_parameter("position_topic").value)
+        self._target_position_topic = str(self.get_parameter("target_position_topic").value)
+        self._speed_topic = str(self.get_parameter("speed_topic").value)
         self._start_mm = float(self.get_parameter("start_mm").value)
         self._end_mm = float(self.get_parameter("end_mm").value)
         self._speed_mm_s = float(self.get_parameter("speed_mm_s").value)
@@ -70,18 +77,18 @@ class ScanCycleNode(Node):
         # ── Callback group (reentrant so services and subs coexist) ──────
         self._cb_group = ReentrantCallbackGroup()
 
-        # ── Subscription: /current_position ──────────────────────────────
+        # ── Subscription: gantry position ─────────────────────────────────
         self._pos_sub = self.create_subscription(
-            Float32,
-            "/current_position",
+            Point,
+            self._position_topic,
             self._on_position,
             10,
             callback_group=self._cb_group,
         )
 
         # ── Publishers ───────────────────────────────────────────────────
-        self._pub_position = self.create_publisher(Float32, "/position", 10)
-        self._pub_speed = self.create_publisher(Float32, "/speed", 10)
+        self._pub_position = self.create_publisher(Point, self._target_position_topic, 10)
+        self._pub_speed = self.create_publisher(Float32, self._speed_topic, 10)
 
         # ── Service clients (scanner) ────────────────────────────────────
         self._cli_start = self.create_client(
@@ -113,9 +120,9 @@ class ScanCycleNode(Node):
 
     # ── Subscription callback ────────────────────────────────────────────────
 
-    def _on_position(self, msg: Float32) -> None:
+    def _on_position(self, msg: Point) -> None:
         with self._pos_lock:
-            self._current_pos_mm = float(msg.data)
+            self._current_pos_mm = float(msg.x)
 
     # ── Public helpers ───────────────────────────────────────────────────────
 
@@ -188,8 +195,10 @@ class ScanCycleNode(Node):
         # Halt the gantry immediately at its current position
         cur = self._get_position_mm()
         if cur is not None:
-            msg = Float32()
-            msg.data = cur
+            msg = Point()
+            msg.x = float(cur)
+            msg.y = 0.0
+            msg.z = 0.0
             self._pub_position.publish(msg)
 
         # Stop the scanner so whatever was accumulated gets saved
@@ -217,8 +226,10 @@ class ScanCycleNode(Node):
             self.get_logger().info(
                 f"Moving to start: {self._start_mm:.1f} mm"
             )
-            msg = Float32()
-            msg.data = self._start_mm
+            msg = Point()
+            msg.x = float(self._start_mm)
+            msg.y = 0.0
+            msg.z = 0.0
             self._pub_position.publish(msg)
 
             if not self._wait_arrival(self._start_mm):
@@ -271,7 +282,7 @@ class ScanCycleNode(Node):
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _wait_arrival(self, target_mm: float) -> bool:
-        """Poll /current_position until within tolerance, timeout, or cancel."""
+        """Poll configured position_topic until within tolerance, timeout, or cancel."""
         deadline = time.monotonic() + self._timeout_s
         while time.monotonic() < deadline:
             if self._cancel.is_set():

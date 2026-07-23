@@ -334,8 +334,8 @@ class FusionMainWindow(QMainWindow):
     def _refresh_status(self) -> None:
         if self.node is None:
             return
-        # micro_ros_agent → /current_position
-        age = self.node.heartbeat_age(self.node.POSITION_TOPIC)
+        # micro_ros_agent → configured position_topic
+        age = self.node.heartbeat_age(self.node.position_topic)
         self.row_micro.set(
             self._classify(age),
             f"{age:.1f}s ago" if age is not None else "no msgs")

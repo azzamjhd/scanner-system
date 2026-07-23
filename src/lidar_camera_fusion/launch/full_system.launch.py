@@ -65,6 +65,18 @@ def generate_launch_description():
             default_value='/dev/ttyUSB0',
             description='Serial port for the micro-ROS / ESP32 firmware'),
         DeclareLaunchArgument(
+            'position_topic',
+            default_value='/current_position',
+            description='Gantry position feedback topic (geometry_msgs/Point; x is scan axis in mm)'),
+        DeclareLaunchArgument(
+            'target_position_topic',
+            default_value='/target_position',
+            description='Gantry target command topic (geometry_msgs/Point; x is scan axis in mm)'),
+        DeclareLaunchArgument(
+            'speed_topic',
+            default_value='/speed',
+            description='Gantry speed command topic (std_msgs/Float32, mm/s)'),
+        DeclareLaunchArgument(
             'lidar_port',
             default_value='/dev/ttyUSB1',
             description='Serial port for RPLiDAR A1'),
@@ -110,7 +122,7 @@ def generate_launch_description():
         # ── scan_assembler_node ────────────────────────────────────────────
         DeclareLaunchArgument(
             'output_dir',
-            default_value=os.path.expanduser('~/ros2_scans'),
+            default_value=os.path.expanduser('~/Documents/ros2_scans'),
             description='Directory where /scanner/stop saves timestamped .pcd files'),
         DeclareLaunchArgument(
             'max_points',
@@ -196,9 +208,11 @@ def generate_launch_description():
 
     # ── 1. micro-ROS agent ─────────────────────────────────────────────────
     # Bridges the ESP32 firmware to ROS 2 over serial.
-    # Publishes:   /current_position  (std_msgs/Float32, mm)
+    # Two-axis gantry firmware publishes geometry_msgs/Point position feedback.
+    # Use position_topic/target_position_topic launch args to select the axis API.
+    # Publishes:   /current_position  (geometry_msgs/Point, x/y/z mm)
     #              /motor_speed       (std_msgs/Float32)
-    # Subscribes:  /position /speed /acceleration  (std_msgs/Float32)
+    # Subscribes:  /target_position /speed /acceleration
     micro_ros_agent = ExecuteProcess(
         cmd=[
             'ros2', 'run', 'micro_ros_agent', 'micro_ros_agent',
@@ -310,6 +324,9 @@ def generate_launch_description():
                     'speed_mm_s':   LaunchConfiguration('scan_speed_mm_s'),
                     'tolerance_mm': LaunchConfiguration('scan_tolerance_mm'),
                     'timeout_s':    LaunchConfiguration('scan_timeout_s'),
+                    'position_topic': LaunchConfiguration('position_topic'),
+                    'target_position_topic': LaunchConfiguration('target_position_topic'),
+                    'speed_topic': LaunchConfiguration('speed_topic'),
                 }],
                 output='screen',
             )
@@ -336,6 +353,7 @@ def generate_launch_description():
                     'max_points':          LaunchConfiguration('max_points'),
                     'publish_rate':        LaunchConfiguration('publish_rate'),
                     'scan_source_frame':   LaunchConfiguration('scan_source_frame'),
+                    'position_topic':      LaunchConfiguration('position_topic'),
                     'add_lidar_static_tf': 'false',
                     'image_topic':             LaunchConfiguration('image_topic'),
                     'pixels_per_mm':           LaunchConfiguration('pixels_per_mm'),

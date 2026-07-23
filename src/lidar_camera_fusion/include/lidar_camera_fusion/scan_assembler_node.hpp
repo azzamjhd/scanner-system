@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/point32.hpp"
 #include "laser_geometry/laser_geometry.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -14,7 +15,6 @@
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "std_msgs/msg/bool.hpp"
-#include "std_msgs/msg/float32.hpp"
 #include "std_srvs/srv/trigger.hpp"
 #include "tf2_ros/buffer.hpp"
 #include "tf2_ros/transform_listener.hpp"
@@ -29,7 +29,7 @@ public:
 
 private:
   void scan_callback(sensor_msgs::msg::LaserScan::ConstSharedPtr msg);
-  void position_callback(std_msgs::msg::Float32::ConstSharedPtr msg);
+  void position_callback(geometry_msgs::msg::Point::ConstSharedPtr msg);
   void publish_callback();
   void clear_callback(
     std::shared_ptr<std_srvs::srv::Trigger::Request> request,
@@ -52,6 +52,7 @@ private:
   // params
   std::string target_frame_;
   std::string scan_topic_;
+  std::string position_topic_;
   std::string output_dir_;
   std::string joint_name_;
   int         max_points_;
@@ -73,7 +74,7 @@ private:
   mutable std::mutex buffer_mutex_;
 
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr  scan_sub_;
-  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr        position_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Point>::SharedPtr       position_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr   cloud_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr   scan_cloud_pub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr    joint_pub_;
