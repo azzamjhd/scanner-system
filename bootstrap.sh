@@ -9,6 +9,14 @@
 #
 set -euo pipefail
 
+# ---- parse arguments ----
+HEADLESS=false
+for arg in "$@"; do
+  if [[ "$arg" == "--headless" ]]; then
+    HEADLESS=true
+  fi
+done
+
 # ---- colour helpers ----
 RED=$(tput setaf 1 2>/dev/null || echo '')
 GREEN=$(tput setaf 2 2>/dev/null || echo '')
@@ -45,8 +53,13 @@ if ! command -v ros2 &>/dev/null; then
   else
     log "ROS 2 repository is already configured in apt sources."
   fi
-  log "Installing ros-jazzy-desktop (this may take a while)…"
-  sudo apt-get install -y ros-jazzy-desktop python3-colcon-common-extensions python3-rosdep
+  if [[ "$HEADLESS" == "true" ]]; then
+    log "Installing ros-jazzy-ros-base (headless bringup)…"
+    sudo apt-get install -y ros-jazzy-ros-base python3-colcon-common-extensions python3-rosdep
+  else
+    log "Installing ros-jazzy-desktop (this may take a while)…"
+    sudo apt-get install -y ros-jazzy-desktop python3-colcon-common-extensions python3-rosdep
+  fi
 fi
 
 # ---- 2. rosdep ----
@@ -58,17 +71,30 @@ rosdep update
 log "Installing system dependencies…"
 
 # rosdep handles ROS-level deps
-rosdep install --from-paths src --ignore-src -y -r \
-  --skip-keys='libpcl-all-dev,libpcl-common1.14,libpcl-io1.14,libpcl-filters1.14,libpcl-segmentation1.14,libpcl-sample-consensus1.14,libpcl-search1.14,libpcl-kdtree1.14' \
-  2>&1 | tail -5
+if [[ "$HEADLESS" == "true" ]]; then
+  # Skip GUI dependencies in rosdep for headless builds
+  rosdep install --from-paths src --ignore-src -y -r \
+    --skip-keys='libpcl-all-dev,libpcl-common1.14,libpcl-io1.14,libpcl-filters1.14,libpcl-segmentation1.14,libpcl-sample-consensus1.14,libpcl-search1.14,libpcl-kdtree1.14,python3-pyqt5,python3-pyqtgraph,python3-matplotlib,python3-tk' \
+    2>&1 | tail -5
+else
+  rosdep install --from-paths src --ignore-src -y -r \
+    --skip-keys='libpcl-all-dev,libpcl-common1.14,libpcl-io1.14,libpcl-filters1.14,libpcl-segmentation1.14,libpcl-sample-consensus1.14,libpcl-search1.14,libpcl-kdtree1.14' \
+    2>&1 | tail -5
+fi
 
-# PCL — rosdep doesn't map versioned .so deps; we use the build-dev metapackage
-sudo apt-get install -y -qq \
-  libpcl-dev \
-  python3-opencv python3-numpy python3-scipy python3-matplotlib \
-  python3-tk \
-  python3-pyqt5 python3-pyqtgraph \
-  python3-pyqt6
+# PCL and other core system libraries
+if [[ "$HEADLESS" == "true" ]]; then
+  sudo apt-get install -y -qq \
+    libpcl-dev \
+    python3-opencv python3-numpy python3-scipy
+else
+  sudo apt-get install -y -qq \
+    libpcl-dev \
+    python3-opencv python3-numpy python3-scipy python3-matplotlib \
+    python3-tk \
+    python3-pyqt5 python3-pyqtgraph \
+    python3-pyqt6
+fi
 
 # ---- 4. Pip dependencies (not in apt) ----
 log "Installing pip dependencies…"
@@ -106,12 +132,25 @@ echo "${GREEN}  Bootstrap complete!${NC}"
 echo ""
 echo "  Source the overlay and run:"
 echo "    source install/setup.bash"
-echo "    ros2 launch lidar_camera_fusion full_system.launch.py"
+if [[ "$HEADLESS" == "true" ]]; then
+  echo "    ros2 launch lidar_camera_fusion hardware_only.launch.py enable_camera:=false"
+  echo ""
+  echo "  To start the SSH curses control panel, run:"
+  echo "    ros2 run lidar_camera_fusion fusion_tui"
+else
+  echo "    ros2 launch lidar_camera_fusion full_system.launch.py"
+fi
 echo ""
 echo "  Without hardware (simulated encoder):"
-echo "    ros2 launch lidar_camera_fusion full_system.launch.py \\"
-echo "      mcu_port:='' lidar_port:=/dev/null scan_mode:=Standard \\"
-echo "      simulate_encoder:=true"
+if [[ "$HEADLESS" == "true" ]]; then
+  echo "    ros2 launch lidar_camera_fusion hardware_only.launch.py \\"
+  echo "      mcu_port:='' lidar_port:=/dev/null scan_mode:=Standard \\"
+  echo "      enable_camera:=false enable_scan_cycle:=false"
+else
+  echo "    ros2 launch lidar_camera_fusion full_system.launch.py \\"
+  echo "      mcu_port:='' lidar_port:=/dev/null scan_mode:=Standard \\"
+  echo "      simulate_encoder:=true"
+fi
 echo ""
 echo "  If using MediaPipe nodes, activate the venv first:"
 echo "    source $MEDIAPIPE_VENV/bin/activate"
