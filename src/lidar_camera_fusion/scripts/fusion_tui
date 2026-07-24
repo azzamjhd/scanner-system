@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Console-script shim that ament installs as `ros2 run lidar_camera_fusion fusion_tui`."""
+from lidar_camera_fusion.fusion_tui import main
+
+if __name__ == "__main__":
+    main()

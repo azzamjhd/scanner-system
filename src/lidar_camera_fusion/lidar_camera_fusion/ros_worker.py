@@ -43,7 +43,42 @@ from std_msgs.msg import Bool, Float32
 from std_srvs.srv import Trigger
 import tf2_ros
 
-from PyQt5.QtCore import QObject, pyqtSignal
+try:
+    from PyQt5.QtCore import QObject, pyqtSignal
+    HAS_PYQT = True
+except ImportError:
+    HAS_PYQT = False
+    class QObject:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    class pyqtSignal:
+        def __init__(self, *types) -> None:
+            self.types = types
+
+        def __get__(self, instance, owner):
+            if instance is None:
+                return self
+            name = f"_signal_{id(self)}"
+            if not hasattr(instance, name):
+                setattr(instance, name, BoundSignal(self.types))
+            return getattr(instance, name)
+
+    class BoundSignal:
+        def __init__(self, types) -> None:
+            self.types = types
+            self._callbacks = []
+
+        def connect(self, callback) -> None:
+            self._callbacks.append(callback)
+
+        def emit(self, *args) -> None:
+            for cb in self._callbacks:
+                try:
+                    cb(*args)
+                except Exception:
+                    pass
+
 
 
 # ── Bridge ──────────────────────────────────────────────────────────────────
