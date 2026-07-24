@@ -30,37 +30,15 @@ err()  { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
 [[ "$(lsb_release -rs 2>/dev/null || echo '')" == "24.04" ]] \
   || err "This bootstrap requires Ubuntu 24.04."
 
-command -v colcon &>/dev/null || command -v ros2 &>/dev/null \
-  || log "ROS 2 Jazzy not found — installing…"
+command -v ros2 &>/dev/null \
+  || err "ROS 2 is not installed or not sourced. Please install/source ROS 2 Jazzy first."
+command -v colcon &>/dev/null \
+  || err "colcon build tool not found. Please install python3-colcon-common-extensions first."
 
 # ---- 0. Pull external dependencies (rplidar_ros) ----
 log "Pulling external dependencies (rplidar_ros)…"
 sudo apt-get install -y -qq python3-vcstool 2>/dev/null || true
 vcs import src < scanner_system.repos 2>/dev/null || true
-
-# ---- 1. Install ROS 2 Jazzy (if absent) ----
-if ! command -v ros2 &>/dev/null; then
-  if ! grep -r -q "packages.ros.org/ros2" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
-    log "Adding ROS 2 repository…"
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq curl gnupg2 lsb-release
-    sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
-      -o /usr/share/keyrings/ros-archive-keyring.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
-      http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" \
-      | sudo tee /etc/apt/sources.list.d/ros2.list >/dev/null
-    sudo apt-get update -qq
-  else
-    log "ROS 2 repository is already configured in apt sources."
-  fi
-  if [[ "$HEADLESS" == "true" ]]; then
-    log "Installing ros-jazzy-ros-base (headless bringup)…"
-    sudo apt-get install -y ros-jazzy-ros-base python3-colcon-common-extensions python3-rosdep
-  else
-    log "Installing ros-jazzy-desktop (this may take a while)…"
-    sudo apt-get install -y ros-jazzy-desktop python3-colcon-common-extensions python3-rosdep
-  fi
-fi
 
 # ---- 2. rosdep ----
 log "Initialising rosdep (if not done)…"
