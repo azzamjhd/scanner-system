@@ -32,15 +32,19 @@ vcs import src < scanner_system.repos 2>/dev/null || true
 
 # ---- 1. Install ROS 2 Jazzy (if absent) ----
 if ! command -v ros2 &>/dev/null; then
-  log "Adding ROS 2 repository…"
-  sudo apt-get update -qq
-  sudo apt-get install -y -qq curl gnupg2 lsb-release
-  sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
-    -o /usr/share/keyrings/ros-archive-keyring.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
-    http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" \
-    | sudo tee /etc/apt/sources.list.d/ros2.list >/dev/null
-  sudo apt-get update -qq
+  if ! grep -r -q "packages.ros.org/ros2" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+    log "Adding ROS 2 repository…"
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq curl gnupg2 lsb-release
+    sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+      -o /usr/share/keyrings/ros-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
+      http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" \
+      | sudo tee /etc/apt/sources.list.d/ros2.list >/dev/null
+    sudo apt-get update -qq
+  else
+    log "ROS 2 repository is already configured in apt sources."
+  fi
   log "Installing ros-jazzy-desktop (this may take a while)…"
   sudo apt-get install -y ros-jazzy-desktop python3-colcon-common-extensions python3-rosdep
 fi
