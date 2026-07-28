@@ -17,6 +17,8 @@ for arg in "$@"; do
   fi
 done
 
+WORKSPACE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
 # ---- colour helpers ----
 RED=$(tput setaf 1 2>/dev/null || echo '')
 GREEN=$(tput setaf 2 2>/dev/null || echo '')
@@ -30,10 +32,35 @@ err()  { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
 [[ "$(lsb_release -rs 2>/dev/null || echo '')" == "24.04" ]] \
   || err "This bootstrap requires Ubuntu 24.04."
 
-command -v ros2 &>/dev/null \
-  || err "ROS 2 is not installed or not sourced. Please install/source ROS 2 Jazzy first."
-command -v colcon &>/dev/null \
-  || err "colcon build tool not found. Please install python3-colcon-common-extensions first."
+# ---- Install / Source ROS 2 Jazzy ----
+ROS_INSTALL_PATH="/opt/ros/jazzy"
+if [[ ! -f "$ROS_INSTALL_PATH/setup.bash" ]]; then
+  log "ROS 2 Jazzy is not installed. Installing..."
+  
+  sudo apt-get update -y -qq
+  sudo apt-get install -y -qq software-properties-common curl gnupg lsb-release
+  sudo add-apt-repository universe -y
+  
+  sudo curl -sSL https://raw.githubusercontent.com/ros2/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
+  
+  sudo apt-get update -y -qq
+  if [[ "$HEADLESS" == "true" ]]; then
+    sudo apt-get install -y -qq ros-jazzy-ros-base
+  else
+    sudo apt-get install -y -qq ros-jazzy-desktop
+  fi
+  sudo apt-get install -y -qq ros-dev-tools python3-rosdep
+fi
+
+# Source ROS 2 for this script
+source "$ROS_INSTALL_PATH/setup.bash"
+
+# ---- Install colcon if missing ----
+if ! command -v colcon &>/dev/null; then
+  log "colcon build tool not found. Installing python3-colcon-common-extensions..."
+  sudo apt-get update -y -qq && sudo apt-get install -y -qq python3-colcon-common-extensions
+fi
 
 # ---- 0. Pull external dependencies (rplidar_ros) ----
 log "Pulling external dependencies (rplidar_ros)…"
@@ -99,6 +126,56 @@ if grep -q 'angle_max = DEG2RAD(359.0f)' "$RPLIDAR_CPP" 2>/dev/null; then
   log "Patching rplidar_ros (359° → 360°)…"
   sed -i 's/DEG2RAD(359.0f)/DEG2RAD(360.0f)/' "$RPLIDAR_CPP"
 fi
+
+# ---- 5.5 Install micro-ROS Agent & PlatformIO ----
+log "Installing micro-ROS Agent…"
+ROS_DISTRO=${ROS_DISTRO:-jazzy}
+
+if ! grep -q "source /opt/ros/.*setup.bash" ~/.bashrc; then
+  echo "source /opt/ros/\$ROS_DISTRO/setup.bash" >> ~/.bashrc
+fi
+
+if ! grep -q "source $WORKSPACE_DIR/install/local_setup.bash" ~/.bashrc; then
+  echo "source $WORKSPACE_DIR/install/local_setup.bash" >> ~/.bashrc
+fi
+
+source /opt/ros/$ROS_DISTRO/setup.bash
+
+mkdir -p ~/microros_ws
+cd ~/microros_ws
+if [[ ! -d "src/micro_ros_setup" ]]; then
+  git clone -b $ROS_DISTRO https://github.com/micro-ROS/micro_ros_setup.git src/micro_ros_setup
+fi
+
+sudo apt update && rosdep update
+rosdep install --from-paths src --ignore-src -y
+sudo apt-get install -y python3-pip
+
+colcon build
+source install/local_setup.bash
+
+ros2 run micro_ros_setup create_agent_ws.sh
+ros2 run micro_ros_setup build_agent.sh
+source install/local_setup.bash
+
+if ! grep -q "source ~/microros_ws/install/local_setup.bash" ~/.bashrc; then
+  echo "source ~/microros_ws/install/local_setup.bash" >> ~/.bashrc
+fi
+
+log "Installing PlatformIO…"
+cd "$WORKSPACE_DIR"
+curl -fsSL -o get-platformio.py https://raw.githubusercontent.com/platformio/platformio-core-installer/master/get-platformio.py
+python3 get-platformio.py
+rm -f get-platformio.py
+
+export PATH="$PATH:$HOME/.platformio/penv/bin"
+
+if ! grep -q "export PATH=\$PATH:\$HOME/.platformio/penv/bin" ~/.bashrc; then
+  echo 'export PATH=$PATH:$HOME/.platformio/penv/bin' >> ~/.bashrc
+fi
+
+cd "$WORKSPACE_DIR/src/lidar_camera_fusion/gantry_2axis_firmware"
+pio init && pio run
 
 # ---- 6. Build ----
 log "Sourcing ROS 2 and building…"
