@@ -64,10 +64,12 @@ fi
 if [[ "$HEADLESS" == "true" ]]; then
   sudo apt-get install -y -qq \
     libpcl-dev \
+    python3-venv \
     python3-opencv python3-numpy python3-scipy
 else
   sudo apt-get install -y -qq \
     libpcl-dev \
+    python3-venv \
     python3-opencv python3-numpy python3-scipy python3-matplotlib \
     python3-tk \
     python3-pyqt5 python3-pyqtgraph \

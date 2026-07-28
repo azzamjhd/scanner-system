@@ -44,6 +44,9 @@ from std_srvs.srv import Trigger
 import tf2_ros
 
 try:
+    import os
+    if os.environ.get("FORCE_HEADLESS") == "1":
+        raise ImportError("Forcing headless mode (bypassing PyQt5)")
     from PyQt5.QtCore import QObject, pyqtSignal
     HAS_PYQT = True
 except ImportError:
@@ -76,8 +79,12 @@ except ImportError:
             for cb in self._callbacks:
                 try:
                     cb(*args)
-                except Exception:
-                    pass
+                except Exception as ex:
+                    try:
+                        with open('/tmp/tui_exceptions.log', 'a') as f:
+                            f.write(f"Exception in callback {cb}: {ex}\n")
+                    except Exception:
+                        pass
 
 
 

@@ -168,6 +168,10 @@ install(DIRECTORY urdf/
   DESTINATION share/${PROJECT_NAME}/urdf
 )
 
+install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
+)
+
 # ─── Python scripts ─────────────────────────────────────────────────────────
 install(PROGRAMS
   scripts/scan_image_recorder_node

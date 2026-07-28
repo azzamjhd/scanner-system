@@ -58,7 +58,7 @@ ros2 run lidar_camera_fusion fusion_tui
 0. Installs `python3-vcstool` and runs `vcs import src < scanner_system.repos` to pull `rplidar_ros`
 1. Installs ROS 2 Jazzy (if absent)
 2. Runs `rosdep install` for all ROS-level dependencies
-3. Installs system packages: PCL, OpenCV, NumPy, SciPy, Matplotlib, Tk, PyQt5, PyQtGraph, PyQt6
+3. Installs system packages: PCL, OpenCV, NumPy, SciPy, Matplotlib, Tk, PyQt5, PyQtGraph, PyQt6, `python3-venv`
 4. Creates a Python `.venv` with `numpy<2` + `mediapipe` (isolated — won't break system packages)
 5. Patches `rplidar_ros` with the A1 `angle_max` fix (359° → 360°)
 6. Builds the workspace with `colcon build --symlink-install`
@@ -155,7 +155,7 @@ Place your `.yaml` calibration file at:
 ~/.ros/camera_info/c922_pro_stream_webcam.yaml
 ```
 
-Or set `camera_info_url` in the launch arguments (default: `file:///home/azzam/Documents/webcam_calibration.yaml`).
+Or set `camera_info_url` in the launch arguments (default: `package://lidar_camera_fusion/config/webcam_calibration.yaml`).
 
 ## Troubleshooting
 

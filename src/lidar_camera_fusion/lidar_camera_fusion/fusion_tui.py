@@ -8,6 +8,10 @@ over SSH sessions on headless systems (e.g. Raspberry Pi) without PyQt5.
 """
 from __future__ import annotations
 
+import os
+# Force headless mode to bypass PyQt5 signals (which require a running Qt Event Loop)
+os.environ["FORCE_HEADLESS"] = "1"
+
 import curses
 import datetime as dt
 import sys

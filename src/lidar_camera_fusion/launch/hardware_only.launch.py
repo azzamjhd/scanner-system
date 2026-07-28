@@ -63,8 +63,8 @@ def generate_launch_description():
 
         DeclareLaunchArgument('camera_device', default_value='/dev/video0',
                               description='V4L2 camera device'),
-        DeclareLaunchArgument('camera_info_url', default_value='file:///home/azzam/Documents/webcam_calibration.yaml',
-                              description='Camera calibration URL'),
+        DeclareLaunchArgument('camera_info_url', default_value='package://lidar_camera_fusion/config/webcam_calibration.yaml',
+                              description='Camera calibration URL (package://... or file:///absolute/path.yaml)'),
         DeclareLaunchArgument('camera_frame_id', default_value='camera_optical_frame',
                               description='Frame stamped on camera images'),
 
