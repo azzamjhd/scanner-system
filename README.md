@@ -146,6 +146,39 @@ Output in `~/ros2_scans/`: `scan_<ts>.pcd` (XYZ), `colored_<ts>.pcd` (XYZRGB),
 `body_<ts>.pcd` (segmented body), `regions_<ts>.pcd` (labeled),
 `stitched_<ts>.png` (panorama).
 
+### Recording rosbags
+
+```bash
+# Minimal (core scan data)
+ros2 bag record \
+  /scan /current_position /joint_states \
+  /scanner/assembled_cloud /scanner/colored_cloud \
+  /tf /tf_static \
+  -o ~/rosbags/scanner_minimal_$(date +%Y%m%d_%H%M%S)
+
+# Full (includes camera for colorization replay)
+ros2 bag record \
+  /scan /current_position /joint_states \
+  /scanner/assembled_cloud /scanner/scan_cloud /scanner/colored_cloud \
+  /image_raw /camera_info \
+  /tf /tf_static /scanner/is_scanning /rosout \
+  -o ~/rosbags/scanner_full_$(date +%Y%m%d_%H%M%S)
+
+# With compression (zstd)
+ros2 bag record \
+  --compression-mode file --compression-format zstd \
+  /scan /current_position /joint_states \
+  /scanner/assembled_cloud /scanner/colored_cloud \
+  /image_raw /camera_info /tf /tf_static \
+  -o ~/rosbags/scanner_compressed_$(date +%Y%m%d_%H%M%S)
+
+# Playback
+ros2 bag info ~/rosbags/scanner_full_20260819_143000
+ros2 bag play ~/rosbags/scanner_full_20260819_143000 --clock
+```
+
+**Key topics**: `/scanner/colored_cloud` (XYZRGB — what Tablet UI displays), `/tf` + `/tf_static` (gantry motion), `/image_raw` + `/camera_info` (re-colorization). Always `unset PYTHONPATH && source /opt/ros/jazzy/setup.bash && source install/setup.bash` before `ros2` commands.
+
 ---
 
 ## Hardware
