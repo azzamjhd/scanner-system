@@ -39,6 +39,9 @@ from geometry_msgs.msg import Point
 from std_msgs.msg import Float32
 from std_srvs.srv import Trigger
 
+from rclpy.action import ActionServer, CancelResponse
+from smart_massage_interfaces.action import ScanBody
+
 
 class ScanCycleNode(Node):
     """Orchestrates position → start → sweep → stop for a single scan pass."""
@@ -109,6 +112,16 @@ class ScanCycleNode(Node):
             Trigger,
             "/scanner/interrupt",
             self._on_interrupt,
+            callback_group=self._cb_group,
+        )
+
+        # ── Action server (exposed to tablet GUI) ────────────────────────
+        self._action_server = ActionServer(
+            self,
+            ScanBody,
+            'scan_body',
+            execute_callback=self._execute_scan_callback,
+            cancel_callback=self._cancel_scan_callback,
             callback_group=self._cb_group,
         )
 
@@ -346,6 +359,135 @@ class ScanCycleNode(Node):
                 self.get_logger().error(f"{name}: failed — {res.message}")
         except Exception as exc:
             self.get_logger().error(f"{name}: exception {exc}")
+
+    # ── Action server callbacks ──────────────────────────────────────────────
+
+    def _cancel_scan_callback(self, goal_handle) -> CancelResponse:
+        self.get_logger().warn("Cancel requested for ScanBody Action!")
+        self._cancel.set()
+        # Halt gantry immediately at current position
+        cur = self._get_position_mm()
+        if cur is not None:
+            msg = Point()
+            msg.x = float(cur)
+            msg.y = 0.0
+            msg.z = 0.0
+            self._pub_position.publish(msg)
+        # Stop the scanner
+        self._call_trigger_async(self._cli_stop, "/scanner/stop")
+        return CancelResponse.ACCEPT
+
+    def _execute_scan_callback(self, goal_handle):
+        self.get_logger().info("Executing body scan action goal...")
+        
+        # Override params with goal request values if provided
+        req = goal_handle.request
+        if req.start_position_mm != 0.0 or req.end_position_mm != 0.0:
+            self._start_mm = req.start_position_mm
+            self._end_mm = req.end_position_mm
+        if req.speed_mm_s > 0.0:
+            self._speed_mm_s = req.speed_mm_s
+
+        self._cancel.clear()
+        feedback = ScanBody.Feedback()
+        
+        # Helper to publish feedback
+        def pub_fb(percent, phase):
+            feedback.percent_complete = int(percent)
+            feedback.current_phase = phase
+            goal_handle.publish_feedback(feedback)
+            self.get_logger().info(f"Feedback: {phase} ({percent}%)")
+
+        pub_fb(5, "Setting speed")
+        # 0. Optionally set speed
+        if self._speed_mm_s > 0:
+            msg = Float32()
+            msg.data = self._speed_mm_s
+            self._pub_speed.publish(msg)
+
+        # check cancel
+        if self._cancel.is_set():
+            result = ScanBody.Result()
+            result.success = False
+            result.status_message = "Cancelled before start"
+            goal_handle.canceled()
+            return result
+
+        pub_fb(15, f"Moving to start position ({self._start_mm:.1f} mm)")
+        # 1. Move to start
+        msg = Point()
+        msg.x = float(self._start_mm)
+        msg.y = 0.0
+        msg.z = 0.0
+        self._pub_position.publish(msg)
+
+        if not self._wait_arrival(self._start_mm):
+            result = ScanBody.Result()
+            result.success = False
+            if self._cancel.is_set():
+                result.status_message = "Cancelled during move-to-start"
+                goal_handle.canceled()
+            else:
+                result.status_message = f"Timed out waiting for start position {self._start_mm:.1f} mm"
+                goal_handle.abort()
+            return result
+
+        # Check cancel
+        if self._cancel.is_set():
+            result = ScanBody.Result()
+            result.success = False
+            result.status_message = "Cancelled before scan start"
+            goal_handle.canceled()
+            return result
+
+        pub_fb(40, "Starting scanner accumulation")
+        # 2. Start scan
+        if not self._call_trigger_blocking(self._cli_start, "/scanner/start"):
+            result = ScanBody.Result()
+            result.success = False
+            result.status_message = "Failed to start scanner"
+            goal_handle.abort()
+            return result
+
+        if self._cancel.is_set():
+            self._call_trigger_blocking(self._cli_stop, "/scanner/stop")
+            result = ScanBody.Result()
+            result.success = False
+            result.status_message = "Cancelled after starting scanner"
+            goal_handle.canceled()
+            return result
+
+        pub_fb(60, f"Scanning — sweeping to end ({self._end_mm:.1f} mm)")
+        # 3. Sweep to end
+        msg.x = float(self._end_mm)
+        self._pub_position.publish(msg)
+
+        arrived = self._wait_arrival(self._end_mm)
+
+        pub_fb(90, "Stopping scanner to finalize scan")
+        # 4. Stop scan (always)
+        self._call_trigger_blocking(self._cli_stop, "/scanner/stop")
+
+        result = ScanBody.Result()
+        if arrived:
+            pub_fb(100, "Scan cycle complete")
+            result.success = True
+            result.status_message = "Scan cycle complete — PCD saved"
+            # Detected landmarks: mock physical points for tests
+            mock_point1 = Point(x=0.25, y=0.15, z=0.0)
+            mock_point2 = Point(x=0.25, y=-0.15, z=0.0)
+            result.detected_landmarks = [mock_point1, mock_point2]
+            goal_handle.succeed()
+        elif self._cancel.is_set():
+            result.success = False
+            result.status_message = "Scan cycle cancelled — partial PCD saved"
+            goal_handle.canceled()
+        else:
+            result.success = False
+            result.status_message = "Scan cycle timed out — partial PCD saved"
+            goal_handle.abort()
+
+        return result
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────

@@ -27,6 +27,7 @@ setup(
         'console_scripts': [
             'scanner_3d_node = medical_scanner_pkg.scanner_3d_node:main',
             'scanner_gui = medical_scanner_pkg.scanner_gui_node:main',
+            'voxel_filter_node = medical_scanner_pkg.voxel_filter_node:main',
         ],
     },
 )

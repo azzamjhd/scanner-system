@@ -1,0 +1,13 @@
+# Goal definition
+geometry_msgs/Point[] selected_points
+float32 force_limit_n
+string massage_pattern
+---
+# Result definition
+bool success
+string status_message
+---
+# Feedback definition
+int32 current_point_index
+int32 percent_complete
+float32 current_force_n

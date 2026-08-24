@@ -1,0 +1,13 @@
+# Goal definition
+float32 start_position_mm
+float32 end_position_mm
+float32 speed_mm_s
+---
+# Result definition
+bool success
+string status_message
+geometry_msgs/Point[] detected_landmarks
+---
+# Feedback definition
+int32 percent_complete
+string current_phase

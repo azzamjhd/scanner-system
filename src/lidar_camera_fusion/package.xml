@@ -21,6 +21,7 @@
   <depend>std_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>std_srvs</depend>
+  <depend>smart_massage_interfaces</depend>
 
   <!-- TF2 stack -->
   <depend>tf2</depend>

@@ -1,0 +1,19 @@
+# SvelteKit build & dev folders
+.svelte-kit/
+build/
+node_modules/
+
+# Local envs
+.env
+.env.*
+!.env.example
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
