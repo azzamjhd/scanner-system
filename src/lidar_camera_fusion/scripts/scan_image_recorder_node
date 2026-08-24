@@ -1,0 +1,849 @@
+#!/usr/bin/env python3
+"""
+scan_image_recorder_node
+========================
+Captures camera frames in exact step with cloud_colorizer_node and composites
+them into a single geometrically-correct panoramic image when the scan stops.
+
+How it works (TF2 approach — same as cloud_colorizer_node)
+----------------------------------------------------------
+For every /scanner/colored_cloud message received while scanning, this node:
+  1. Grabs the latest buffered /image_raw frame.
+  2. Calls tf_buffer.lookup_transform('base_link', camera_frame, Time(0)) —
+     the same "latest available" lookup the colorizer uses — to get the
+     camera's exact position in world space.
+  3. Extracts the camera's X coordinate (the gantry travel axis, per the URDF).
+  4. Stores (image, x_mm) for later compositing.
+
+On /scanner/is_scanning = false, a background thread builds the panorama:
+  - Frames are sorted by their recorded X position.
+  - Each frame is placed at canvas_offset = (x_mm - x_min) * pixels_per_mm.
+  - Overlapping regions are blended by pixel-averaging (same as an alpha blend
+    with equal weights).
+  - The result is saved as  <output_dir>/stitched_YYYYMMDD_HHMMSS.png.
+
+No phase correlation, no ORB, no AffineStitcher.  Alignment is 100% driven by
+the TF tree that already describes the physical geometry of the robot.
+
+Scan control
+------------
+/scanner/is_scanning  (std_msgs/Bool, transient_local)
+  true  → clear frame buffer, start capturing
+  false → stop capturing, composite + save in a background thread
+
+Capture trigger
+---------------
+Frames are captured on /scanner/colored_cloud (the same trigger as the
+colorizer) BUT gated by `min_capture_spacing_mm` of gantry travel since the
+last captured frame. This decouples capture density from gantry speed:
+  - slow scan  → fewer redundant near-duplicate frames
+  - fast scan  → frames spaced exactly min_capture_spacing_mm apart along X
+
+Side-to-side jitter
+-------------------
+The Logitech C922 has noticeable tangential distortion (p1, p2) and an
+off-center principal point.  As features scroll down through different
+image rows during the scan, those distortions deflect them sideways by
+varying amounts — visible as horizontal jitter at the strip boundaries.
+We rectify each frame with `cv2.remap` using the K and D matrices from
+/camera_info before it enters the buffer; after rectification, columns
+map linearly to world-Y and the jitter is gone.  Toggle with
+`undistort_images` (default true).
+
+Distance source priority for auto pixels_per_mm
+-----------------------------------------------
+  1. `pixels_per_mm` parameter (non-zero)               — manual override
+  2. LiDAR live distance  (`use_lidar_distance=true`)   — fx / Z_lidar
+  3. `working_distance_mm` parameter                    — fx / Z_param
+  4. Hard fallback                                       — 2.0 px/mm
+
+LiDAR distance estimate
+-----------------------
+The RPLiDAR A1 is mounted on the gantry pointing down (URDF rpy="0 -1.5708 0")
+so it sees the subject directly below.  Each /scan, we take the median of the
+closest `lidar_distance_quantile` fraction of valid ranges — robust against
+spurious far returns (walls, ceiling) and noise.
+
+Stitching algorithm: center-strip (no blending)
+------------------------------------------------
+Frames are stacked **vertically** (canvas grows downward) because the URDF
+mounts the camera so that gantry travel along world-X projects to image-Y
+(image rows). Each output pixel comes from exactly ONE source frame:
+  - Canvas Y of frame i's center = (x_i - x_min) * pixels_per_mm + H/2
+  - Strip boundary between frames i and i+1 = midpoint of their canvas centers
+  - Frame i contributes a horizontal strip of source rows around the frame
+    center (least lens-distorted region) covering rows
+    [boundary_{i-1,i}, boundary_{i,i+1}] on the canvas.
+This eliminates the multi-frame averaging blur of the previous accumulator.
+
+Parameters
+----------
+output_dir              string   "."                    .pcd / .png output dir
+image_topic             string   "/image_raw"           camera topic to buffer
+camera_info_topic       string   "/camera_info"         camera intrinsics topic
+scan_topic              string   "/scan"                LiDAR topic for live distance
+base_frame              string   "base_link"            TF target frame
+camera_frame            string   "camera_optical_frame" TF source frame
+min_capture_spacing_mm  float    10.0                   min gantry travel between
+                                                        captured frames
+undistort_images        bool     true                   rectify each frame using K, D
+                                                        from /camera_info before
+                                                        buffering (kills lens-distortion
+                                                        side-to-side jitter)
+use_lidar_distance      bool     true                   prefer live LiDAR over param
+lidar_distance_quantile float    0.25                   take median of closest 25 %
+working_distance_mm     float    500.0                  fallback Z if LiDAR off / no data
+pixels_per_mm           float    0.0                    manual override (0 = auto)
+"""
+
+import os
+import threading
+from datetime import datetime
+from typing import List, Optional, Tuple
+
+import cv2
+import numpy as np
+import rclpy
+import rclpy.time
+import tf2_ros
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
+from sensor_msgs.msg import CameraInfo, Image, LaserScan, PointCloud2
+from std_msgs.msg import Bool
+
+from rcl_interfaces.msg import SetParametersResult
+
+try:
+    from cv_bridge import CvBridge as _CvBridge
+    _BRIDGE: Optional[_CvBridge] = _CvBridge()
+except ImportError:
+    _BRIDGE = None
+
+
+class ScanImageRecorderNode(Node):
+
+    def __init__(self) -> None:
+        super().__init__('scan_image_recorder_node')
+
+        # ── Parameters ──────────────────────────────────────────────────
+        self.declare_parameter('output_dir',              '.')
+        self.declare_parameter('image_topic',             '/image_raw')
+        self.declare_parameter('camera_info_topic',       '/camera_info')
+        self.declare_parameter('scan_topic',              '/scan')
+        self.declare_parameter('base_frame',              'base_link')
+        self.declare_parameter('camera_frame',            'camera_optical_frame')
+        self.declare_parameter('min_capture_spacing_mm',  10.0)
+        self.declare_parameter('undistort_images',        True)
+        self.declare_parameter('use_lidar_distance',      True)
+        self.declare_parameter('lidar_distance_quantile', 0.25)
+        self.declare_parameter('working_distance_mm',     500.0)
+        # 0.0 → auto-compute. Non-zero overrides everything.
+        self.declare_parameter('pixels_per_mm',           0.0)
+
+        self._output_dir:              str   = self.get_parameter('output_dir').value
+        self._image_topic:             str   = self.get_parameter('image_topic').value
+        self._camera_info_topic:       str   = self.get_parameter('camera_info_topic').value
+        self._scan_topic:              str   = self.get_parameter('scan_topic').value
+        self._base_frame:              str   = self.get_parameter('base_frame').value
+        self._camera_frame:            str   = self.get_parameter('camera_frame').value
+        self._min_capture_spacing_mm:  float = max(0.0, float(
+            self.get_parameter('min_capture_spacing_mm').value))
+        self._undistort_images:        bool  = bool(
+            self.get_parameter('undistort_images').value)
+        self._use_lidar_distance:      bool  = bool(
+            self.get_parameter('use_lidar_distance').value)
+        self._lidar_distance_quantile: float = float(
+            self.get_parameter('lidar_distance_quantile').value)
+        self._working_distance_mm:     float = float(
+            self.get_parameter('working_distance_mm').value)
+        self._pixels_per_mm_override:  float = float(
+            self.get_parameter('pixels_per_mm').value)
+
+        # Clamp the quantile to a sensible range
+        self._lidar_distance_quantile = float(
+            np.clip(self._lidar_distance_quantile, 0.05, 1.0))
+
+        # fx (pixels) from the first /camera_info; live LiDAR-derived distance (mm)
+        self._fx_px:            Optional[float] = None
+        self._lidar_distance_mm: Optional[float] = None
+
+        # Undistortion state — populated on first valid /camera_info
+        self._undistort_map1: Optional[np.ndarray] = None
+        self._undistort_map2: Optional[np.ndarray] = None
+        self._undistort_size: Optional[Tuple[int, int]] = None  # (w, h)
+
+        # X position of the most recently captured frame (mm) — None means
+        # "no frame captured yet this session", so the next one is forced.
+        self._last_captured_x_mm: Optional[float] = None
+
+        # Live parameter updates — lets `ros2 param set` and the GUI
+        # change behaviour without restarting the node. Without this,
+        # the cached self._* attributes would stay at their startup values.
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
+        # ── TF2 (same pattern as cloud_colorizer_node) ─────────────────────
+        # The buffer is populated by the node's own executor — no separate
+        # spin_thread needed because rclpy.spin() already drives this node.
+        self._tf_buffer   = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(
+            self._tf_buffer, self)
+
+        # ── Internal state ─────────────────────────────────────────────────
+        self._lock        = threading.Lock()
+        self._is_scanning = False
+        self._latest_bgr: Optional[np.ndarray] = None
+        # Monotonic id of the most recently buffered frame and the id that was
+        # last *captured*. Used to reject re-capturing the SAME physical frame
+        # at two different gantry X positions when the camera fps is below the
+        # colored-cloud trigger rate (a real source of duplicated strips).
+        self._latest_frame_id:   int = 0
+        self._last_captured_id:  int = -1
+        # Each entry is (image_bgr, gantry_x_mm) — x comes from TF, not position topic
+        self._frames: List[Tuple[np.ndarray, float]] = []
+
+        # ── Subscriptions ──────────────────────────────────────────────────
+        latched = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self.create_subscription(
+            Bool, '/scanner/is_scanning',
+            self._is_scanning_cb, latched)
+
+        self.create_subscription(
+            Image, self._image_topic,
+            self._image_cb, qos_profile_sensor_data)
+
+        # /camera_info — published by v4l2_camera_node from the calibration YAML
+        # (camera_info_url).  We only need fx, so latching is unnecessary;
+        # default reliable QoS matches the v4l2 publisher.
+        self.create_subscription(
+            CameraInfo, self._camera_info_topic,
+            self._camera_info_cb, 10)
+
+        # /scan — LiDAR ranges, used to estimate live working distance.
+        # rplidar publishes with sensor_data QoS (best-effort).
+        self.create_subscription(
+            LaserScan, self._scan_topic,
+            self._scan_cb, qos_profile_sensor_data)
+
+        # Capture trigger — fires at publish_rate Hz, the same moment the
+        # colorizer commits a frame to the colored point cloud.
+        self.create_subscription(
+            PointCloud2, '/scanner/colored_cloud',
+            self._colored_cloud_cb, qos_profile_sensor_data)
+
+        self.get_logger().info(
+            'scan_image_recorder_node ready — '
+            f'image_topic={self._image_topic}, '
+            f'camera_info_topic={self._camera_info_topic}, '
+            f'scan_topic={self._scan_topic}, '
+            f'base_frame={self._base_frame}, '
+            f'camera_frame={self._camera_frame}, '
+            f'min_capture_spacing_mm={self._min_capture_spacing_mm:.2f}, '
+            f'undistort_images={self._undistort_images}, '
+            f'use_lidar_distance={self._use_lidar_distance}, '
+            f'lidar_distance_quantile={self._lidar_distance_quantile:.2f}, '
+            f'working_distance_mm={self._working_distance_mm:.1f}, '
+            f'pixels_per_mm_override={self._pixels_per_mm_override:.2f} '
+            f'(0 = auto), '
+            f'output_dir={self._output_dir}'
+        )
+
+    # ── Callbacks ──────────────────────────────────────────────────────────────
+
+    def _on_set_parameters(self, params) -> SetParametersResult:
+        """Apply runtime parameter updates to the cached self._* attributes.
+
+        Without this callback, `ros2 param set` would update the parameter
+        server but leave the node's cached values stale — the very issue
+        that made `min_capture_spacing_mm` appear to have no effect.
+
+        Called BEFORE each set is committed; returning successful=False
+        rejects the change.
+        """
+        for p in params:
+            try:
+                if p.name == 'min_capture_spacing_mm':
+                    new_val = max(0.0, float(p.value))
+                    with self._lock:
+                        self._min_capture_spacing_mm = new_val
+                    self.get_logger().info(
+                        f'min_capture_spacing_mm → {new_val:.2f} mm (live)')
+
+                elif p.name == 'working_distance_mm':
+                    new_val = float(p.value)
+                    with self._lock:
+                        self._working_distance_mm = new_val
+                    self.get_logger().info(
+                        f'working_distance_mm → {new_val:.1f} mm (live)')
+
+                elif p.name == 'pixels_per_mm':
+                    new_val = float(p.value)
+                    with self._lock:
+                        self._pixels_per_mm_override = new_val
+                    self.get_logger().info(
+                        f'pixels_per_mm override → {new_val:.3f} (live, '
+                        f'0 = auto)')
+
+                elif p.name == 'use_lidar_distance':
+                    new_val = bool(p.value)
+                    with self._lock:
+                        self._use_lidar_distance = new_val
+                    self.get_logger().info(
+                        f'use_lidar_distance → {new_val} (live)')
+
+                elif p.name == 'undistort_images':
+                    new_val = bool(p.value)
+                    with self._lock:
+                        self._undistort_images = new_val
+                    self.get_logger().info(
+                        f'undistort_images → {new_val} (live)')
+
+                elif p.name == 'lidar_distance_quantile':
+                    new_val = float(np.clip(float(p.value), 0.05, 1.0))
+                    with self._lock:
+                        self._lidar_distance_quantile = new_val
+                    self.get_logger().info(
+                        f'lidar_distance_quantile → {new_val:.2f} (live)')
+
+                elif p.name == 'output_dir':
+                    new_val = str(p.value)
+                    with self._lock:
+                        self._output_dir = new_val
+                    self.get_logger().info(
+                        f'output_dir → {new_val} (live)')
+
+                # base_frame, camera_frame, image_topic, camera_info_topic,
+                # scan_topic are wired into subscriptions/TF — they cannot
+                # be changed without restarting the node, so we accept the
+                # set silently but the new value won't take effect.
+            except (TypeError, ValueError) as ex:
+                self.get_logger().error(
+                    f'Rejected param {p.name}={p.value}: {ex}')
+                return SetParametersResult(successful=False, reason=str(ex))
+
+        return SetParametersResult(successful=True)
+
+    def _image_cb(self, msg: Image) -> None:
+        """Buffer the latest decoded camera frame, always.
+
+        If undistort_images=true and the rectification maps are ready,
+        the frame is rectified before being stored.  This kills the
+        side-to-side jitter that lens distortion causes when features
+        scroll down through different image rows.
+        """
+        bgr = self._decode(msg)
+        if bgr is None:
+            return
+
+        with self._lock:
+            do_undistort  = self._undistort_images
+            map1          = self._undistort_map1
+            map2          = self._undistort_map2
+            expected_size = self._undistort_size
+
+        if (do_undistort
+            and map1 is not None
+            and map2 is not None
+            and expected_size is not None
+            and (bgr.shape[1], bgr.shape[0]) == expected_size):
+            bgr = cv2.remap(bgr, map1, map2, interpolation=cv2.INTER_LINEAR)
+
+        with self._lock:
+            self._latest_bgr = bgr
+            self._latest_frame_id += 1
+
+    def _camera_info_cb(self, msg: CameraInfo) -> None:
+        """Cache fx and pre-compute undistortion maps from the camera intrinsics.
+
+        msg.k is the row-major 3×3 intrinsic matrix:
+            k = [fx,  0, cx,
+                  0, fy, cy,
+                  0,  0,  1]
+        msg.d is the distortion vector (plumb-bob: k1, k2, p1, p2, k3).
+        msg.p is the rectified projection matrix; after undistortion the
+        image has the intrinsics encoded in P[:3, :3], so we use that fx
+        for `pixels_per_mm` to keep the canvas scale geometrically correct.
+
+        With v4l2_camera_node, both k and d originate from the camera_info_url
+        YAML calibration file (e.g. webcam_calibration.yaml).
+        """
+        if self._fx_px is not None:
+            return  # already cached
+
+        try:
+            K = np.asarray(msg.k, dtype=np.float64).reshape(3, 3)
+            D = np.asarray(msg.d, dtype=np.float64).ravel()
+            P = np.asarray(msg.p, dtype=np.float64).reshape(3, 4)
+            w, h = int(msg.width), int(msg.height)
+        except (TypeError, ValueError):
+            return
+
+        if w <= 0 or h <= 0:
+            return
+
+        # After undistortion the rectified image has P's intrinsics, so use
+        # P[0,0] as fx when undistortion is enabled.  When it is not, the
+        # raw image still has K's intrinsics so K[0,0] is correct.
+        fx_rect = float(P[0, 0]) if P[0, 0] > 0 else float(K[0, 0])
+        fx_raw  = float(K[0, 0])
+        fx = fx_rect if self._undistort_images else fx_raw
+        if fx <= 0.0 or not np.isfinite(fx):
+            return
+        self._fx_px = fx
+
+        # Pre-compute the undistortion remap LUTs once — cv2.remap with
+        # CV_16SC2 maps is extremely fast (~ms per frame at 640×480).
+        try:
+            new_K = P[:3, :3].copy()
+            map1, map2 = cv2.initUndistortRectifyMap(
+                K, D,
+                R=None,
+                newCameraMatrix=new_K,
+                size=(w, h),
+                m1type=cv2.CV_16SC2,
+            )
+            with self._lock:
+                self._undistort_map1 = map1
+                self._undistort_map2 = map2
+                self._undistort_size = (w, h)
+            self.get_logger().info(
+                f'/camera_info received: fx_raw={fx_raw:.2f} px, '
+                f'fx_rect={fx_rect:.2f} px, '
+                f'undistort_images={self._undistort_images}  —  '
+                f'auto pixels_per_mm at {self._working_distance_mm:.0f} mm '
+                f'(working_distance_mm fallback) = '
+                f'{fx / self._working_distance_mm:.3f} px/mm'
+            )
+        except cv2.error as ex:
+            self.get_logger().error(
+                f'Failed to build undistortion maps: {ex}  —  '
+                'falling back to raw frames'
+            )
+
+    def _scan_cb(self, msg: LaserScan) -> None:
+        """Robust estimate of the camera-to-subject distance from a LiDAR sweep.
+
+        The RPLiDAR A1 is mounted pointing down (URDF rpy="0 -1.5708 0") so the
+        majority of beams hit the subject below. We take the median of the
+        closest `lidar_distance_quantile` fraction of valid ranges — the
+        subject is what's closest, while far returns are walls / ceiling /
+        gantry frame and get filtered out.
+        """
+        try:
+            ranges = np.asarray(msg.ranges, dtype=np.float32)
+        except (TypeError, ValueError):
+            return
+        if ranges.size == 0:
+            return
+
+        valid = (
+            np.isfinite(ranges)
+            & (ranges >= float(msg.range_min))
+            & (ranges <= float(msg.range_max))
+        )
+        if not np.any(valid):
+            return
+        valid_ranges = ranges[valid]
+
+        cutoff = float(np.quantile(valid_ranges, self._lidar_distance_quantile))
+        closest = valid_ranges[valid_ranges <= cutoff]
+        if closest.size == 0:
+            return
+
+        distance_m  = float(np.median(closest))
+        distance_mm = distance_m * 1000.0
+        if not np.isfinite(distance_mm) or distance_mm <= 0.0:
+            return
+
+        with self._lock:
+            self._lidar_distance_mm = distance_mm
+
+    def _colored_cloud_cb(self, _msg: PointCloud2) -> None:
+        """Capture trigger — fires whenever the colorizer publishes a colored cloud.
+
+        Gated by min_capture_spacing_mm: a frame is only kept if the gantry
+        has moved at least that far since the last captured frame. This makes
+        capture density a function of *gantry travel*, not wall-clock time.
+        """
+        with self._lock:
+            if not self._is_scanning or self._latest_bgr is None:
+                return
+            frame = self._latest_bgr.copy()
+            frame_id = self._latest_frame_id
+            # Reject the SAME physical frame being captured twice. If the camera
+            # hasn't delivered a new frame since the last capture, painting it
+            # at a new X just duplicates a strip — drop it.
+            if frame_id == self._last_captured_id:
+                return
+
+        # ── TF lookup: where is the camera right now? ──────────────────
+        try:
+            tf_stamped = self._tf_buffer.lookup_transform(
+                self._base_frame,
+                self._camera_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=0.0),
+            )
+        except tf2_ros.TransformException as ex:
+            self.get_logger().warn_throttle(
+                self.get_clock(), 2000,
+                f'TF lookup ({self._base_frame} → {self._camera_frame}) '
+                f'failed, skipping frame: {ex}')
+            return
+
+        x_m  = tf_stamped.transform.translation.x
+        x_mm = x_m * 1000.0
+
+        # ── Gate by gantry travel since last capture ───────────────────────
+        with self._lock:
+            if (self._last_captured_x_mm is not None
+                and abs(x_mm - self._last_captured_x_mm)
+                    < self._min_capture_spacing_mm):
+                # not far enough — drop this frame silently
+                return
+
+            self._frames.append((frame, x_mm))
+            self._last_captured_x_mm = x_mm
+            self._last_captured_id = frame_id
+            count = len(self._frames)
+
+        self.get_logger().debug(
+            f'Frame #{count} captured at x={x_mm:.2f} mm (TF-based)')
+
+    def _is_scanning_cb(self, msg: Bool) -> None:
+        with self._lock:
+            if msg.data:
+                self._frames.clear()
+                self._last_captured_x_mm = None   # force first frame to capture
+                self._last_captured_id = -1       # reset dup guard
+                self._is_scanning = True
+                self.get_logger().info(
+                    'Scan started — image frame buffer cleared '
+                    f'(min_capture_spacing_mm={self._min_capture_spacing_mm:.2f})')
+                return
+
+            self._is_scanning = False
+            frames_copy = list(self._frames)
+
+        if not frames_copy:
+            self.get_logger().warn(
+                'Scan stopped but no frames captured — '
+                'is the camera connected and cloud_colorizer_node running?'
+            )
+            return
+
+        self.get_logger().info(
+            f'Scan stopped — compositing {len(frames_copy)} frames '
+            f'(TF-based placement) in background …'
+        )
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        threading.Thread(
+            target=self._composite_and_save,
+            args=(frames_copy, timestamp),
+            daemon=True,
+        ).start()
+
+    # ── TF-based canvas compositing ────────────────────────────────────────────────
+
+    def _resolve_pixels_per_mm(self) -> float:
+        """Return the pixels_per_mm to use for the canvas.
+
+        Priority chain (highest first):
+          1. `pixels_per_mm` parameter (non-zero)         — manual override
+          2. LiDAR-derived distance + camera fx           — fully automatic
+          3. `working_distance_mm` parameter + camera fx  — fixed estimate
+          4. Hard fallback 2.0 px/mm                       — only if no fx yet
+        """
+        # 1. manual override
+        if self._pixels_per_mm_override > 0.0:
+            return self._pixels_per_mm_override
+
+        if self._fx_px is None:
+            self.get_logger().warn(
+                'No /camera_info received yet — falling back to 2.0 px/mm. '
+                f'Check that v4l2_camera_node is publishing on '
+                f'{self._camera_info_topic}.'
+            )
+            return 2.0
+
+        # 2. live LiDAR-derived distance
+        if self._use_lidar_distance:
+            with self._lock:
+                z_mm = self._lidar_distance_mm
+            if z_mm is not None and z_mm > 0.0:
+                ppm = self._fx_px / z_mm
+                self.get_logger().info(
+                    f'pixels_per_mm = fx / Z_lidar = '
+                    f'{self._fx_px:.2f} / {z_mm:.1f} mm = {ppm:.3f} px/mm'
+                )
+                return ppm
+            self.get_logger().warn(
+                f'use_lidar_distance=true but no /scan data on '
+                f'{self._scan_topic} — using working_distance_mm fallback'
+            )
+
+        # 3. parameter fallback
+        if self._working_distance_mm > 0.0:
+            ppm = self._fx_px / self._working_distance_mm
+            self.get_logger().info(
+                f'pixels_per_mm = fx / working_distance_mm = '
+                f'{self._fx_px:.2f} / {self._working_distance_mm:.1f} mm = '
+                f'{ppm:.3f} px/mm'
+            )
+            return ppm
+
+        # 4. hard fallback
+        return 2.0
+
+    def _composite_and_save(
+        self,
+        frames: List[Tuple[np.ndarray, float]],
+        timestamp: str,
+    ) -> None:
+        """Center-strip composite: each canvas pixel comes from exactly ONE frame.
+
+        Vertical stacking
+        -----------------
+        The URDF chains gantry_to_camera (rpy 0 1.5708 3.14159) and
+        camera_to_optical (rpy -1.5708 0 -1.5708). Composing the two:
+
+            R_optical_in_world = [[0, 1, 0],
+                                  [1, 0, 0],
+                                  [0, 0, -1]]
+
+        That is, image-Y (rows) is aligned with world-X (gantry travel).
+        So as the gantry moves along +X, subject features scroll along
+        the image's Y axis — the panorama therefore grows DOWN, not sideways.
+
+        Algorithm
+        ---------
+        1. Sort frames by recorded gantry X.
+        2. Resolve pixels_per_mm (LiDAR > param > fallback).
+        3. canvas_h = (x_max - x_min) * pixels_per_mm + frame_h.
+           canvas_w = frame_w.
+        4. For each frame i:
+             center_canvas_y = (x_i - x_min) * pixels_per_mm + frame_h / 2
+           Boundaries between consecutive frame centers split the canvas
+           rows into N non-overlapping strips, one per frame:
+             strip_i = [boundary_{i-1, i}, boundary_{i, i+1}]
+           Frame 0's strip extends to the canvas top edge; frame N-1's
+           strip extends to the canvas bottom edge.
+        5. Each frame contributes pixels from the source-frame row range
+           [strip_top - canvas_top_of_frame, strip_bottom - canvas_top_of_frame]
+           — these come from the *centre* of the frame for interior frames
+           (least lens-distorted), and from the leading / trailing edge for
+           the first / last frames.
+        """
+        os.makedirs(self._output_dir, exist_ok=True)
+        filepath = os.path.join(self._output_dir, f'stitched_{timestamp}.png')
+
+        # 1. sort by gantry X so the panorama reads top → bottom regardless
+        #    of scan direction
+        frames_sorted = sorted(frames, key=lambda f: f[1])
+        imgs   = [f[0] for f in frames_sorted]
+        xs_mm  = [f[1] for f in frames_sorted]
+
+        # ── Persist raw source frames + manifest so the scan can be
+        #    re-stitched offline (the live composite below is throwaway;
+        #    the frames are the real data). Offline tooling can apply
+        #    sub-pixel registration / blending that is too slow to run here.
+        try:
+            self._dump_session(frames_sorted, timestamp)
+        except Exception as ex:  # never let archiving kill the live save
+            self.get_logger().warn(f'Frame archive failed (non-fatal): {ex}')
+
+        # 2. resolve scale
+        pixels_per_mm = self._resolve_pixels_per_mm()
+
+        frame_h, frame_w = imgs[0].shape[:2]
+        x_min = xs_mm[0]
+        x_max = xs_mm[-1]
+        travel_mm = x_max - x_min
+
+        if travel_mm < 0.01:
+            self.get_logger().warn(
+                'Gantry travel < 0.01 mm — saving last frame as panorama')
+            cv2.imwrite(filepath, imgs[-1])
+            self.get_logger().info(
+                f'Stitched image saved → {filepath}  '
+                f'(single frame, {frame_w}×{frame_h} px)')
+            return
+
+        # 3. canvas dimensions — grows DOWNWARD with gantry travel
+        canvas_h = int(travel_mm * pixels_per_mm) + frame_h
+        canvas_w = frame_w
+
+        # 4. canvas-Y of each frame's TOP EDGE and CENTER
+        py_starts  = [int(round((x - x_min) * pixels_per_mm)) for x in xs_mm]
+        py_centers = [p + frame_h // 2 for p in py_starts]
+
+        # Strip boundaries along the canvas Y axis — N+1 boundaries for N frames.
+        # Interior boundaries sit at the midpoint between adjacent frame
+        # centers; the outer two are clamped to the canvas top/bottom.
+        n = len(imgs)
+        boundaries = [0]
+        for i in range(1, n):
+            boundaries.append((py_centers[i - 1] + py_centers[i]) // 2)
+        boundaries.append(canvas_h)
+
+        self.get_logger().info(
+            f'Center-strip canvas (vertical): {canvas_w}×{canvas_h} px  '
+            f'(travel={travel_mm:.1f} mm, '
+            f'pixels_per_mm={pixels_per_mm:.3f}, '
+            f'frames={n})'
+        )
+
+        # 5. paint each strip directly — no averaging, no overlap
+        result = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+
+        for i, img in enumerate(imgs):
+            canvas_top    = boundaries[i]
+            canvas_bottom = boundaries[i + 1]
+
+            # Source row range: relative to this frame's top edge
+            src_top    = canvas_top    - py_starts[i]
+            src_bottom = canvas_bottom - py_starts[i]
+
+            # Clamp to the actual frame height — handles edge frames whose
+            # strip spills past the source frame on the outer side.
+            src_top    = max(0, src_top)
+            src_bottom = min(frame_h, src_bottom)
+
+            # Recompute matching canvas range after clamping
+            canvas_top    = py_starts[i] + src_top
+            canvas_bottom = py_starts[i] + src_bottom
+
+            if src_bottom <= src_top or canvas_bottom <= canvas_top:
+                continue
+
+            iw = min(frame_w, img.shape[1])
+            result[canvas_top:canvas_bottom, :iw] = (
+                img[src_top:src_bottom, :iw])
+
+        cv2.imwrite(filepath, result)
+        self.get_logger().info(
+            f'Stitched image saved → {filepath}  '
+            f'({canvas_w}×{canvas_h} px, {n} frames, '
+            f'travel={travel_mm:.1f} mm, vertical center-strip)'
+        )
+
+    # ── Session archiving (for offline re-stitching) ───────────────────────
+
+    def _dump_session(
+        self,
+        frames_sorted: List[Tuple[np.ndarray, float]],
+        timestamp: str,
+    ) -> None:
+        """Write raw source frames + a manifest.json under a per-session dir.
+
+        Layout:
+            <output_dir>/scan_session_<timestamp>/
+                frame_0000.png ... frame_NNNN.png   (undistorted BGR, as captured)
+                manifest.json
+
+        The manifest records each frame's gantry X (mm) and the scale/geometry
+        context needed to re-stitch offline with higher-quality registration
+        and blending than the live center-strip composite.
+        """
+        import json
+
+        session_dir = os.path.join(
+            self._output_dir, f'scan_session_{timestamp}')
+        os.makedirs(session_dir, exist_ok=True)
+
+        with self._lock:
+            z_mm = self._lidar_distance_mm
+        ppm = self._resolve_pixels_per_mm()
+
+        frame_records = []
+        for i, (img, x_mm) in enumerate(frames_sorted):
+            fname = f'frame_{i:04d}.png'
+            cv2.imwrite(os.path.join(session_dir, fname), img)
+            frame_records.append({'file': fname, 'x_mm': float(x_mm)})
+
+        manifest = {
+            'timestamp': timestamp,
+            'frame_count': len(frames_sorted),
+            'min_capture_spacing_mm': self._min_capture_spacing_mm,
+            'undistort_images': self._undistort_images,
+            'fx_px': self._fx_px,
+            'lidar_distance_mm': z_mm,
+            'working_distance_mm': self._working_distance_mm,
+            'resolved_pixels_per_mm': ppm,
+            'base_frame': self._base_frame,
+            'camera_frame': self._camera_frame,
+            'frames': frame_records,
+        }
+        with open(os.path.join(session_dir, 'manifest.json'), 'w') as fh:
+            json.dump(manifest, fh, indent=2)
+
+        self.get_logger().info(
+            f'Archived {len(frames_sorted)} source frames + manifest → '
+            f'{session_dir}  (re-stitch offline for higher quality)'
+        )
+
+    # ── Image decoding ─────────────────────────────────────────────────────
+
+    def _decode(self, msg: Image) -> Optional[np.ndarray]:
+        """Convert sensor_msgs/Image → BGR uint8 numpy array.
+
+        cv_bridge handles any encoding (YUYV, mono, rgb8, …) automatically.
+        Falls back to manual decode for the common bgr8/rgb8/mono8 cases if
+        cv_bridge is not installed.
+        """
+        if _BRIDGE is not None:
+            try:
+                return _BRIDGE.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            except Exception:
+                pass
+
+        enc  = msg.encoding.lower()
+        data = np.frombuffer(msg.data, dtype=np.uint8)
+
+        if enc in ('bgr8', 'rgb8'):
+            ch = 3
+            if msg.step < msg.width * ch:
+                return None
+            img = data.reshape((msg.height, msg.step))[:, :msg.width * ch]
+            img = img.reshape(msg.height, msg.width, ch)
+            if enc == 'rgb8':
+                img = img[:, :, ::-1]
+            return np.ascontiguousarray(img)
+
+        if enc == 'mono8':
+            if msg.step < msg.width:
+                return None
+            gray = data.reshape((msg.height, msg.step))[:, :msg.width]
+            gray = gray.reshape(msg.height, msg.width)
+            return np.ascontiguousarray(np.dstack([gray, gray, gray]))
+
+        self.get_logger().warn(
+            f'Unsupported image encoding: {msg.encoding} — '
+            'install cv_bridge for automatic conversion'
+        )
+        return None
+
+
+def main() -> None:
+    rclpy.init()
+    node = ScanImageRecorderNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

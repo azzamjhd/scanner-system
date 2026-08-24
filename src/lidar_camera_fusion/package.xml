@@ -13,6 +13,7 @@
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
 
   <!-- Core ROS2 -->
   <depend>rclcpp</depend>
@@ -34,16 +35,39 @@
   <!-- PCL ↔ ROS2 bridge (pcl_ros not required) -->
   <depend>pcl_conversions</depend>
 
-  <!-- System PCL (no ROS wrapper) -->
+  <!-- System PCL (no ROS wrapper). body_preprocess_node also needs the
+       segmentation / filters / sample_consensus / search / kdtree libs. -->
   <build_depend>libpcl-all-dev</build_depend>
   <exec_depend>libpcl-common1.14</exec_depend>
   <exec_depend>libpcl-io1.14</exec_depend>
+  <exec_depend>libpcl-filters1.14</exec_depend>
+  <exec_depend>libpcl-segmentation1.14</exec_depend>
+  <exec_depend>libpcl-sample-consensus1.14</exec_depend>
+  <exec_depend>libpcl-search1.14</exec_depend>
+  <exec_depend>libpcl-kdtree1.14</exec_depend>
 
   <!-- Image processing -->
   <depend>cv_bridge</depend>
+  <exec_depend>image_proc</exec_depend>
 
   <!-- Time-synchronized subscriptions -->
   <depend>message_filters</depend>
+
+  <!-- scan_image_recorder_node + manual_segmentation_node (Python) -->
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
+  <exec_depend>python3-tk</exec_depend>
+  <exec_depend>sensor_msgs_py</exec_depend>
+
+  <!-- manual_segmentation_node GUI (pyqtgraph + PyQt5) -->
+  <exec_depend>python3-pyqtgraph</exec_depend>
+
+  <!-- fusion_gui (Python + Qt) -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>tf2_ros_py</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
+  <exec_depend>python3-pyqt5</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

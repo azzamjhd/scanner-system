@@ -25,6 +25,7 @@ ScanAssemblerNode::ScanAssemblerNode(const rclcpp::NodeOptions & options)
   // ── Parameters ────────────────────────────────────────────────────────────
   declare_parameter("target_frame", "base_link");
   declare_parameter("scan_topic",   "/scan");
+  declare_parameter("position_topic", "/current_position");
   declare_parameter("output_dir",   ".");
   declare_parameter("joint_name",   "gantry_joint");
   declare_parameter("max_points",   500000);
@@ -32,6 +33,7 @@ ScanAssemblerNode::ScanAssemblerNode(const rclcpp::NodeOptions & options)
 
   target_frame_ = get_parameter("target_frame").as_string();
   scan_topic_   = get_parameter("scan_topic").as_string();
+  position_topic_ = get_parameter("position_topic").as_string();
   output_dir_   = get_parameter("output_dir").as_string();
   joint_name_   = get_parameter("joint_name").as_string();
   max_points_   = get_parameter("max_points").as_int();
@@ -56,10 +58,10 @@ ScanAssemblerNode::ScanAssemblerNode(const rclcpp::NodeOptions & options)
     rclcpp::SensorDataQoS(),
     std::bind(&ScanAssemblerNode::scan_callback, this, std::placeholders::_1));
 
-  // Gantry bridge — converts /current_position (Float32, mm) → /joint_states (m)
-  // so robot_state_publisher keeps the TF tree in sync with the real encoder.
-  position_sub_ = create_subscription<std_msgs::msg::Float32>(
-    "/current_position", 10,
+  // Gantry bridge — converts configured geometry_msgs/Point position topic (x mm)
+  // to /joint_states (m) so robot_state_publisher keeps the TF tree in sync.
+  position_sub_ = create_subscription<geometry_msgs::msg::Point>(
+    position_topic_, 10,
     std::bind(&ScanAssemblerNode::position_callback, this, std::placeholders::_1));
 
   // ── Publishers ─────────────────────────────────────────────────────────
@@ -105,24 +107,24 @@ ScanAssemblerNode::ScanAssemblerNode(const rclcpp::NodeOptions & options)
 
   RCLCPP_INFO(
     get_logger(),
-    "scan_assembler_node: '%s' → '%s', joint='%s', max_points=%d, rate=%.1f Hz, output_dir='%s'",
-    scan_topic_.c_str(), target_frame_.c_str(), joint_name_.c_str(),
+    "scan_assembler_node: scan='%s' → '%s', position='%s', joint='%s', max_points=%d, rate=%.1f Hz, output_dir='%s'",
+    scan_topic_.c_str(), target_frame_.c_str(), position_topic_.c_str(), joint_name_.c_str(),
     max_points_, publish_rate_, output_dir_.c_str());
 }
 
 // ── position_callback ───────────────────────────────────────────────────────
-// Converts /current_position (mm) → /joint_states (m).
+// Converts configured position_topic Point.x (mm) → /joint_states (m).
 // robot_state_publisher consumes /joint_states to animate gantry_joint,
 // which is the dynamic edge in the TF tree that gives each scan ring its
 // correct 3-D position in base_link space.
 
 void ScanAssemblerNode::position_callback(
-  std_msgs::msg::Float32::ConstSharedPtr msg)
+  geometry_msgs::msg::Point::ConstSharedPtr msg)
 {
   sensor_msgs::msg::JointState js;
   js.header.stamp = now();
   js.name         = {joint_name_};
-  js.position     = {static_cast<double>(msg->data) / 1000.0};   // mm → m
+  js.position     = {static_cast<double>(msg->x) / 1000.0};   // mm → m
   joint_pub_->publish(js);
 }
 

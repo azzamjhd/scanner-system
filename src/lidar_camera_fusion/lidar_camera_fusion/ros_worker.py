@@ -31,13 +31,14 @@ from rclpy.qos import (
 )
 
 from rcl_interfaces.msg import Log, ParameterDescriptor, ParameterType
+from geometry_msgs.msg import Point
 from rcl_interfaces.srv import (
     DescribeParameters,
     GetParameters,
     ListParameters,
     SetParameters,
 )
-from sensor_msgs.msg import Image, LaserScan
+from sensor_msgs.msg import Image, LaserScan, PointCloud2
 from std_msgs.msg import Bool, Float32
 from std_srvs.srv import Trigger
 import tf2_ros
@@ -118,13 +119,15 @@ class _Heartbeats:
 class FusionGuiNode(Node):
     """All ROS 2 entities live here. Spins in a background thread."""
 
-    SCAN_TOPIC          = "/scan"
-    POSITION_TOPIC      = "/current_position"
-    IMAGE_TOPIC         = "/image_raw"
-    IS_SCANNING_TOPIC   = "/scanner/is_scanning"
-    ROSOUT_TOPIC        = "/rosout"
+    SCAN_TOPIC             = "/scan"
+    DEFAULT_POSITION_TOPIC = "/current_position"
+    IMAGE_TOPIC            = "/image_raw"
+    IS_SCANNING_TOPIC      = "/scanner/is_scanning"
+    ASSEMBLED_CLOUD_TOPIC  = "/scanner/assembled_cloud"
+    COLORED_CLOUD_TOPIC    = "/scanner/colored_cloud"
+    ROSOUT_TOPIC           = "/rosout"
 
-    POSITION_PUB_TOPIC  = "/position"
+    DEFAULT_TARGET_POSITION_TOPIC = "/target_position"
     SPEED_PUB_TOPIC     = "/speed"
 
     SVC_START   = "/scanner/start"
@@ -134,10 +137,11 @@ class FusionGuiNode(Node):
     TF_TARGET   = "base_link"
     TF_SOURCE   = "lidar_link"
 
-    # nodes whose health we monitor in the status panel
+    # nodes whose health we monitor in the status panel and param auto-discover
     MONITORED_NODES = (
         "scan_assembler_node",
         "cloud_colorizer_node",
+        "scan_image_recorder_node",
         "robot_state_publisher",
         "v4l2_camera_node",
     )
@@ -147,6 +151,13 @@ class FusionGuiNode(Node):
         self.bridge = bridge
         self.cb_group = ReentrantCallbackGroup()
         self.heartbeats = _Heartbeats()
+
+        self.declare_parameter("position_topic", self.DEFAULT_POSITION_TOPIC)
+        self.declare_parameter("target_position_topic", self.DEFAULT_TARGET_POSITION_TOPIC)
+        self.declare_parameter("speed_topic", self.SPEED_PUB_TOPIC)
+        self.position_topic = str(self.get_parameter("position_topic").value)
+        self.target_position_topic = str(self.get_parameter("target_position_topic").value)
+        self.speed_topic = str(self.get_parameter("speed_topic").value)
 
         # latest known gantry position (mm); None until first message
         self._current_pos_mm: Optional[float] = None
@@ -168,11 +179,17 @@ class FusionGuiNode(Node):
             LaserScan, self.SCAN_TOPIC,
             self._on_scan, sensor_qos, callback_group=self.cb_group)
         self.create_subscription(
-            Float32, self.POSITION_TOPIC,
+            Point, self.position_topic,
             self._on_position, 10, callback_group=self.cb_group)
         self.create_subscription(
             Image, self.IMAGE_TOPIC,
             self._on_image, sensor_qos, callback_group=self.cb_group)
+        self.create_subscription(
+            PointCloud2, self.ASSEMBLED_CLOUD_TOPIC,
+            self._on_assembled_cloud, sensor_qos, callback_group=self.cb_group)
+        self.create_subscription(
+            PointCloud2, self.COLORED_CLOUD_TOPIC,
+            self._on_colored_cloud, sensor_qos, callback_group=self.cb_group)
 
         # transient_local matches scan_assembler's publisher
         latched_qos = QoSProfile(
@@ -191,8 +208,8 @@ class FusionGuiNode(Node):
             self._on_rosout, 100, callback_group=self.cb_group)
 
         # ── Publishers ───────────────────────────────────────────────────────
-        self.pub_position = self.create_publisher(Float32, self.POSITION_PUB_TOPIC, 10)
-        self.pub_speed    = self.create_publisher(Float32, self.SPEED_PUB_TOPIC, 10)
+        self.pub_position = self.create_publisher(Point, self.target_position_topic, 10)
+        self.pub_speed    = self.create_publisher(Float32, self.speed_topic, 10)
 
         # ── Service clients ──────────────────────────────────────────────────
         self.cli_start = self.create_client(
@@ -216,15 +233,23 @@ class FusionGuiNode(Node):
         self.heartbeats.touch(self.SCAN_TOPIC)
         self.bridge.scan_heartbeat.emit()
 
-    def _on_position(self, msg: Float32) -> None:
-        self.heartbeats.touch(self.POSITION_TOPIC)
+    def _on_position(self, msg: Point) -> None:
+        # Two-axis gantry reports position as geometry_msgs/Point; scanner axis uses x (mm).
+        x_mm = float(msg.x)
+        self.heartbeats.touch(self.position_topic)
         with self._pos_lock:
-            self._current_pos_mm = float(msg.data)
-        self.bridge.position_heartbeat.emit(float(msg.data))
+            self._current_pos_mm = x_mm
+        self.bridge.position_heartbeat.emit(x_mm)
 
     def _on_image(self, _msg: Image) -> None:
         self.heartbeats.touch(self.IMAGE_TOPIC)
         self.bridge.image_heartbeat.emit()
+
+    def _on_assembled_cloud(self, _msg: PointCloud2) -> None:
+        self.heartbeats.touch(self.ASSEMBLED_CLOUD_TOPIC)
+
+    def _on_colored_cloud(self, _msg: PointCloud2) -> None:
+        self.heartbeats.touch(self.COLORED_CLOUD_TOPIC)
 
     def _on_is_scanning(self, msg: Bool) -> None:
         self.bridge.is_scanning_changed.emit(bool(msg.data))
@@ -282,8 +307,10 @@ class FusionGuiNode(Node):
     # ── Position publishing ─────────────────────────────────────────────────
 
     def publish_position(self, mm: float) -> None:
-        msg = Float32()
-        msg.data = float(mm)
+        msg = Point()
+        msg.x = float(mm)
+        msg.y = 0.0
+        msg.z = 0.0
         self.pub_position.publish(msg)
 
     def publish_speed(self, mm_s: float) -> None:
@@ -328,7 +355,7 @@ class FusionGuiNode(Node):
         self.bridge.sweep_state_changed.emit(state.name, human)
 
     def _wait_arrival(self, target_mm: float, timeout_s: float) -> bool:
-        """Poll /current_position until within tolerance or timeout/cancel."""
+        """Poll configured position_topic until within tolerance or timeout/cancel."""
         cfg = self._sweep_cfg
         if cfg is None:
             return False

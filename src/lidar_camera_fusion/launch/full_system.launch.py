@@ -65,6 +65,18 @@ def generate_launch_description():
             default_value='/dev/ttyUSB0',
             description='Serial port for the micro-ROS / ESP32 firmware'),
         DeclareLaunchArgument(
+            'position_topic',
+            default_value='/current_position',
+            description='Gantry position feedback topic (geometry_msgs/Point; x is scan axis in mm)'),
+        DeclareLaunchArgument(
+            'target_position_topic',
+            default_value='/target_position',
+            description='Gantry target command topic (geometry_msgs/Point; x is scan axis in mm)'),
+        DeclareLaunchArgument(
+            'speed_topic',
+            default_value='/speed',
+            description='Gantry speed command topic (std_msgs/Float32, mm/s)'),
+        DeclareLaunchArgument(
             'lidar_port',
             default_value='/dev/ttyUSB1',
             description='Serial port for RPLiDAR A1'),
@@ -110,7 +122,7 @@ def generate_launch_description():
         # ── scan_assembler_node ────────────────────────────────────────────
         DeclareLaunchArgument(
             'output_dir',
-            default_value=os.path.expanduser('~/ros2_scans'),
+            default_value=os.path.expanduser('~/Documents/ros2_scans'),
             description='Directory where /scanner/stop saves timestamped .pcd files'),
         DeclareLaunchArgument(
             'max_points',
@@ -123,6 +135,46 @@ def generate_launch_description():
 
         # ── fusion.launch.py passthrough ───────────────────────────────────
         DeclareLaunchArgument(
+            'image_topic',
+            default_value='/image_raw',
+            description='Camera topic for scan_image_recorder_node '
+                        '(must match the remapped topic from v4l2_camera_node)'),
+        DeclareLaunchArgument(
+            'working_distance_mm',
+            default_value='500.0',
+            description='scan_image_recorder_node: fallback camera → subject distance '
+                        'in mm. Used only when use_lidar_distance=false or no /scan '
+                        'data has arrived yet.'),
+        DeclareLaunchArgument(
+            'use_lidar_distance',
+            default_value='true',
+            description='scan_image_recorder_node: use live LiDAR distance from /scan '
+                        'as the camera-to-subject distance Z. When true, the panorama '
+                        'auto-calibrates to the actual subject distance every scan.'),
+        DeclareLaunchArgument(
+            'min_capture_spacing_mm',
+            default_value='10.0',
+            description='scan_image_recorder_node: minimum gantry travel (mm) between '
+                        'captured frames. Decouples capture density from gantry speed; '
+                        'set to 0 to capture every colored-cloud message.'),
+        DeclareLaunchArgument(
+            'undistort_images',
+            default_value='true',
+            description='scan_image_recorder_node: rectify each frame using K and D '
+                        'from /camera_info before stitching. Strongly recommended for '
+                        'cameras with non-trivial tangential distortion (e.g. C922).'),
+        DeclareLaunchArgument(
+            'lidar_distance_quantile',
+            default_value='0.25',
+            description='scan_image_recorder_node: take the median of the closest '
+                        'fraction of valid LiDAR ranges as the subject distance. '
+                        '0.25 = closest 25 %% of beams (robust against ceiling/walls).'),
+        DeclareLaunchArgument(
+            'pixels_per_mm',
+            default_value='0.0',
+            description='scan_image_recorder_node: manual canvas scale override. '
+                        '0 = auto-compute from camera intrinsics + working_distance_mm.'),
+        DeclareLaunchArgument(
             'scan_source_frame',
             default_value='lidar_link',
             description='frame_id that rplidar_ros publishes /scan in. '
@@ -130,13 +182,37 @@ def generate_launch_description():
                         'is only added when the frame is NOT already in the '
                         'URDF TF tree (e.g. use "laser" for the rplidar '
                         'default, "lidar_link" for this hardware setup).'),
+
+        # ── scan_cycle_node ────────────────────────────────────────────────
+        DeclareLaunchArgument(
+            'scan_start_mm',
+            default_value='0.0',
+            description='Gantry start position (mm) for /scanner/start_cycle'),
+        DeclareLaunchArgument(
+            'scan_end_mm',
+            default_value='1850.0',
+            description='Gantry end position (mm) for /scanner/start_cycle'),
+        DeclareLaunchArgument(
+            'scan_speed_mm_s',
+            default_value='30.0',
+            description='Gantry speed (mm/s) during scan sweep'),
+        DeclareLaunchArgument(
+            'scan_tolerance_mm',
+            default_value='0.5',
+            description='Arrival tolerance (mm) for position check'),
+        DeclareLaunchArgument(
+            'scan_timeout_s',
+            default_value='60.0',
+            description='Per-segment arrival timeout (s)'),
     ]
 
     # ── 1. micro-ROS agent ─────────────────────────────────────────────────
     # Bridges the ESP32 firmware to ROS 2 over serial.
-    # Publishes:   /current_position  (std_msgs/Float32, mm)
+    # Two-axis gantry firmware publishes geometry_msgs/Point position feedback.
+    # Use position_topic/target_position_topic launch args to select the axis API.
+    # Publishes:   /current_position  (geometry_msgs/Point, x/y/z mm)
     #              /motor_speed       (std_msgs/Float32)
-    # Subscribes:  /position /speed /acceleration  (std_msgs/Float32)
+    # Subscribes:  /target_position /speed /acceleration
     micro_ros_agent = ExecuteProcess(
         cmd=[
             'ros2', 'run', 'micro_ros_agent', 'micro_ros_agent',
@@ -201,6 +277,62 @@ def generate_launch_description():
         output='screen',
     )
 
+    # ── 4b. Camera control locks ───────────────────────────────────────────
+    # Lock focus / exposure / white-balance so the intrinsics stay valid:
+    # autofocus changes the focal length, which invalidates the calibration.
+    # Applied via v4l2-ctl AFTER the node is streaming — passing these as node
+    # params at startup corrupts VIDIOC_REQBUFS on the C922. Delayed 4 s so the
+    # camera is up first. Auto-off lines MUST precede the manual values, since
+    # focus_absolute / exposure_time_absolute are [inactive] until auto is off.
+    # focus_absolute=0 is infinity focus — raise it if the subject is blurry at
+    # the working distance, then never touch it again (calibrate at that focus).
+    camera_locks = TimerAction(
+        period=4.0,
+        actions=[
+            ExecuteProcess(
+                cmd=[
+                    'v4l2-ctl', '-d', LaunchConfiguration('camera_device'),
+                    '--set-ctrl=focus_automatic_continuous=0',
+                    '--set-ctrl=white_balance_automatic=0',
+                    '--set-ctrl=auto_exposure=1',
+                    '--set-ctrl=exposure_dynamic_framerate=0',
+                    '--set-ctrl=focus_absolute=0',
+                    '--set-ctrl=exposure_time_absolute=500',
+                    '--set-ctrl=white_balance_temperature=4000',
+                    '--set-ctrl=gain=0',
+                ],
+                output='screen',
+            )
+        ],
+    )
+
+    # ── 5.1. Scan cycle orchestrator ──────────────────────────────────────
+    # Provides /scanner/start_cycle (Trigger) and /scanner/interrupt (Trigger)
+    # for Foxglove Call Service panels.  Reads its own params so the operator
+    # can change start_mm / end_mm / speed_mm_s via ros2 param set between
+    # scans without relaunching.
+    scan_cycle_node = TimerAction(
+        period=3.5,
+        actions=[
+            Node(
+                package='lidar_camera_fusion',
+                executable='scan_cycle_node',
+                name='scan_cycle_node',
+                parameters=[{
+                    'start_mm':     LaunchConfiguration('scan_start_mm'),
+                    'end_mm':       LaunchConfiguration('scan_end_mm'),
+                    'speed_mm_s':   LaunchConfiguration('scan_speed_mm_s'),
+                    'tolerance_mm': LaunchConfiguration('scan_tolerance_mm'),
+                    'timeout_s':    LaunchConfiguration('scan_timeout_s'),
+                    'position_topic': LaunchConfiguration('position_topic'),
+                    'target_position_topic': LaunchConfiguration('target_position_topic'),
+                    'speed_topic': LaunchConfiguration('speed_topic'),
+                }],
+                output='screen',
+            )
+        ],
+    )
+
     # ── 5. Fusion pipeline ─────────────────────────────────────────────────
     # Delayed 2 s to give robot_state_publisher time to fill the TF buffer
     # before scan_assembler_node starts calling lookupTransform.
@@ -217,11 +349,39 @@ def generate_launch_description():
                     os.path.join(fusion_share, 'launch', 'fusion.launch.py')
                 ),
                 launch_arguments={
-                    'output_dir':           LaunchConfiguration('output_dir'),
-                    'max_points':           LaunchConfiguration('max_points'),
-                    'publish_rate':         LaunchConfiguration('publish_rate'),
-                    'scan_source_frame':    LaunchConfiguration('scan_source_frame'),
-                    'add_lidar_static_tf':  'false',
+                    'output_dir':          LaunchConfiguration('output_dir'),
+                    'max_points':          LaunchConfiguration('max_points'),
+                    'publish_rate':        LaunchConfiguration('publish_rate'),
+                    'scan_source_frame':   LaunchConfiguration('scan_source_frame'),
+                    'position_topic':      LaunchConfiguration('position_topic'),
+                    'add_lidar_static_tf': 'false',
+                    'image_topic':             LaunchConfiguration('image_topic'),
+                    'pixels_per_mm':           LaunchConfiguration('pixels_per_mm'),
+                    'working_distance_mm':     LaunchConfiguration('working_distance_mm'),
+                    'use_lidar_distance':      LaunchConfiguration('use_lidar_distance'),
+                    'lidar_distance_quantile': LaunchConfiguration('lidar_distance_quantile'),
+                    'min_capture_spacing_mm':  LaunchConfiguration('min_capture_spacing_mm'),
+                    'undistort_images':        LaunchConfiguration('undistort_images'),
+                }.items(),
+            )
+        ],
+    )
+
+    # ── 6. Segmentation pipeline ───────────────────────────────────────────
+    # body_preprocess_node (RANSAC bed removal + cluster) + manual_segmentation_node
+    # (pyqtgraph polygon GUI). Delayed by 3 s — slightly after fusion_launch — so
+    # /scanner/colored_cloud is publishing by the time body_preprocess_node
+    # subscribes. Listens to /scanner/is_scanning to clear/save its own caches
+    # in lockstep with the rest of the pipeline.
+    segmentation_launch = TimerAction(
+        period=3.0,
+        actions=[
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(fusion_share, 'launch', 'segmentation.launch.py')
+                ),
+                launch_arguments={
+                    'output_dir': LaunchConfiguration('output_dir'),
                 }.items(),
             )
         ],
@@ -232,5 +392,8 @@ def generate_launch_description():
         rplidar_launch,
         scanner_bridge_launch,
         camera_node,
+        camera_locks,
+        scan_cycle_node,
         fusion_launch,
+        segmentation_launch,
     ])

@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""
+manual_segmentation_node
+========================
+Interactive 2D polygon-selection GUI over a top-down (Z-projected) view
+of /scanner/body_cloud. The user draws N labeled polygons; every body
+point that falls inside a polygon (in X-Y) is tagged with the polygon's
+label and republished on /scanner/segmented_regions as a PointCloud2 with
+an extra `label` (uint8) field.
+
+Workflow
+--------
+1. Wait for /scanner/body_cloud (latched snapshot from body_preprocess_node).
+2. On user request (button / startup), grab the *latest* body cloud and
+   open a matplotlib window with a top-down scatter (X horizontal, Y
+   vertical, optional RGB if present).
+3. User picks a label from a side panel, then draws a polygon. Repeat.
+   Polygon overlap is resolved by *last-wins* — the most recently drawn
+   polygon claims the point. This matches user expectation (draw → adjust).
+4. "Publish" -> publish PointCloud2 with labels and save labeled PCD to
+   <output_dir>/regions_<YYYYMMDD_HHMMSS>.pcd.
+
+GUI design choices
+------------------
+- matplotlib only (already an apt dep). No new system packages.
+- Tkinter dialogs for label entry to avoid wiring a custom Qt panel.
+- The matplotlib spin runs on the main thread; ROS spinning runs in a
+  background thread. Cross-thread state is guarded by a single lock.
+- We project on (x, y) with z stored as the brightness when no RGB is
+  available, so the user can still see body contours.
+
+Caveats
+-------
+- The view is a vertical (top-down) projection. Anything occluded along
+  Z (e.g. arm-over-torso) gets the same label as whatever is below it.
+  That is acceptable for the massage workflow per the supervisor.
+- Label IDs are 1..N. 0 is reserved for "unlabeled" and is included in
+  the output cloud (so downstream consumers can see every body point).
+"""
+
+import os
+import struct
+import threading
+import time
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+
+import rclpy
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+
+from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs_py import point_cloud2 as pc2
+from std_msgs.msg import Bool, Header
+from std_srvs.srv import Trigger
+
+
+# Matplotlib + Tk are imported lazily so headless unit tests can import
+# the module without a display.
+def _import_gui():
+    import matplotlib
+    matplotlib.use("TkAgg", force=True)
+    import matplotlib.pyplot as plt
+    from matplotlib.path import Path
+    from matplotlib.widgets import Button, PolygonSelector
+    import tkinter as tk
+    from tkinter import simpledialog
+    return plt, Path, PolygonSelector, Button, tk, simpledialog
+
+
+# ── Default region presets (the "vocabulary" the user will use) ────────────
+DEFAULT_REGIONS = [
+    "head",
+    "shoulders",
+    "upper_back",
+    "lower_back",
+    "left_arm",
+    "right_arm",
+    "left_leg",
+    "right_leg",
+    "other",
+]
+
+
+def _make_color(idx: int) -> Tuple[float, float, float]:
+    """Stable distinct color per label index (1..N) using an HSV hash."""
+    import colorsys
+    h = (idx * 0.6180339887) % 1.0  # golden-ratio sweep -> well separated hues
+    r, g, b = colorsys.hsv_to_rgb(h, 0.65, 0.95)
+    return r, g, b
+
+
+# ── Helpers: PointCloud2 <-> numpy ─────────────────────────────────────────
+
+def _xyzrgb_from_msg(msg: PointCloud2) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Returns (XYZ Nx3 float32, optional RGB Nx3 uint8) from a PointCloud2.
+
+    Uses sensor_msgs_py.point_cloud2.read_points to get a structured array,
+    then splits it cleanly.
+
+    NOTE: we do NOT pass skip_nans=True. The PCL `rgb` field is a float32
+    whose 32-bit pattern is 0x00RRGGBB; for many ordinary colors that bit
+    pattern is itself a float NaN. read_points(skip_nans=True) would then
+    drop every point whose *color* happens to look like NaN — silently
+    deleting valid geometry (this caused body_*.pcd N pts -> regions_*.pcd
+    fewer pts). We read everything and filter only on XYZ being finite, so
+    color never removes a point.
+    """
+    field_names = {f.name for f in msg.fields}
+    has_rgb = "rgb" in field_names
+
+    fields = ("x", "y", "z", "rgb") if has_rgb else ("x", "y", "z")
+    arr = pc2.read_points(msg, field_names=fields, skip_nans=False)
+    if arr.size == 0:
+        return np.empty((0, 3), dtype=np.float32), None
+
+    x = np.asarray(arr["x"], dtype=np.float32)
+    y = np.asarray(arr["y"], dtype=np.float32)
+    z = np.asarray(arr["z"], dtype=np.float32)
+
+    # Filter on geometry only — keep a point iff its x/y/z are all finite.
+    finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+
+    xyz = np.stack([x[finite], y[finite], z[finite]], axis=-1).astype(np.float32)
+    rgb_u8: Optional[np.ndarray] = None
+
+    if has_rgb:
+        # rgb is packed float32 whose 32-bit pattern is 0x00RRGGBB. Reinterpret
+        # the raw bits as uint32 WITHOUT going through any float arithmetic
+        # (which could normalize a NaN bit pattern and corrupt the color).
+        rgb_raw = np.asarray(arr["rgb"])
+        rgb_int = rgb_raw.view(np.uint32)[finite]
+        r = ((rgb_int >> 16) & 0xFF).astype(np.uint8)
+        g = ((rgb_int >>  8) & 0xFF).astype(np.uint8)
+        b = ( rgb_int        & 0xFF).astype(np.uint8)
+        rgb_u8 = np.stack([r, g, b], axis=-1)
+
+    return xyz, rgb_u8
+
+
+def _build_labeled_cloud(
+    header: Header,
+    xyz: np.ndarray,
+    rgb_u8: Optional[np.ndarray],
+    labels: np.ndarray,
+) -> PointCloud2:
+    """Pack XYZ(+RGB)+label into a PointCloud2.
+
+    Layout is float32 x, float32 y, float32 z, [uint32 rgb,] uint8 label,
+    aligned to a fixed point_step. We write raw bytes to keep dependencies
+    minimal and to control padding.
+    """
+    n = xyz.shape[0]
+    if n == 0:
+        msg = PointCloud2()
+        msg.header = header
+        msg.height = 1
+        msg.width = 0
+        msg.is_dense = False
+        return msg
+
+    has_rgb = rgb_u8 is not None
+    if has_rgb:
+        # x:0 y:4 z:8 rgb:12 label:16  -> point_step 20
+        point_step = 20
+        fields = [
+            PointField(name="x",     offset=0,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="y",     offset=4,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="z",     offset=8,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="rgb",   offset=12, datatype=PointField.UINT32,  count=1),
+            PointField(name="label", offset=16, datatype=PointField.UINT8,   count=1),
+        ]
+        buf = np.zeros((n, point_step), dtype=np.uint8)
+        # XYZ
+        buf[:,  0: 4] = np.frombuffer(xyz[:, 0].astype(np.float32).tobytes(),
+                                      dtype=np.uint8).reshape(n, 4)
+        buf[:,  4: 8] = np.frombuffer(xyz[:, 1].astype(np.float32).tobytes(),
+                                      dtype=np.uint8).reshape(n, 4)
+        buf[:,  8:12] = np.frombuffer(xyz[:, 2].astype(np.float32).tobytes(),
+                                      dtype=np.uint8).reshape(n, 4)
+        # RGB packed as 0x00RRGGBB uint32 (matches PCL XYZRGB convention)
+        rgb_packed = (
+            (rgb_u8[:, 0].astype(np.uint32) << 16) |
+            (rgb_u8[:, 1].astype(np.uint32) <<  8) |
+            (rgb_u8[:, 2].astype(np.uint32))
+        )
+        buf[:, 12:16] = np.frombuffer(rgb_packed.tobytes(),
+                                      dtype=np.uint8).reshape(n, 4)
+        # label
+        buf[:, 16] = labels.astype(np.uint8)
+    else:
+        # x:0 y:4 z:8 label:12  -> point_step 13 (we round to 16 for alignment)
+        point_step = 16
+        fields = [
+            PointField(name="x",     offset=0,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="y",     offset=4,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="z",     offset=8,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="label", offset=12, datatype=PointField.UINT8,   count=1),
+        ]
+        buf = np.zeros((n, point_step), dtype=np.uint8)
+        buf[:,  0: 4] = np.frombuffer(xyz[:, 0].astype(np.float32).tobytes(),
+                                      dtype=np.uint8).reshape(n, 4)
+        buf[:,  4: 8] = np.frombuffer(xyz[:, 1].astype(np.float32).tobytes(),
+                                      dtype=np.uint8).reshape(n, 4)
+        buf[:,  8:12] = np.frombuffer(xyz[:, 2].astype(np.float32).tobytes(),
+                                      dtype=np.uint8).reshape(n, 4)
+        buf[:, 12] = labels.astype(np.uint8)
+
+    msg = PointCloud2()
+    msg.header = header
+    msg.height = 1
+    msg.width = n
+    msg.fields = fields
+    msg.is_bigendian = False
+    msg.point_step = point_step
+    msg.row_step = point_step * n
+    msg.is_dense = False
+    msg.data = buf.tobytes()
+    return msg
+
+
+def _save_pcd_ascii_with_label(
+    path: str,
+    xyz: np.ndarray,
+    rgb_u8: Optional[np.ndarray],
+    labels: np.ndarray,
+) -> None:
+    """Write a PCL-compatible ASCII .pcd with x y z [rgb] label.
+
+    Matches PCL's XYZRGBL/XYZL conventions enough for CloudCompare to load
+    the file and color points by label. The rgb column is packed as the
+    standard PCL float (cast of 0x00RRGGBB).
+    """
+    n = xyz.shape[0]
+    has_rgb = rgb_u8 is not None
+    fields = ["x", "y", "z"]
+    sizes  = [4, 4, 4]
+    types_ = ["F", "F", "F"]
+    counts = [1, 1, 1]
+    if has_rgb:
+        fields.append("rgb"); sizes.append(4); types_.append("F"); counts.append(1)
+    fields.append("label"); sizes.append(4); types_.append("U"); counts.append(1)
+
+    header = (
+        "# .PCD v0.7 - Point Cloud Data file format\n"
+        "VERSION 0.7\n"
+        f"FIELDS {' '.join(fields)}\n"
+        f"SIZE {' '.join(str(s) for s in sizes)}\n"
+        f"TYPE {' '.join(types_)}\n"
+        f"COUNT {' '.join(str(c) for c in counts)}\n"
+        f"WIDTH {n}\n"
+        "HEIGHT 1\n"
+        "VIEWPOINT 0 0 0 1 0 0 0\n"
+        f"POINTS {n}\n"
+        "DATA ascii\n"
+    )
+
+    with open(path, "w") as f:
+        f.write(header)
+        if has_rgb:
+            rgb_packed = (
+                (rgb_u8[:, 0].astype(np.uint32) << 16) |
+                (rgb_u8[:, 1].astype(np.uint32) <<  8) |
+                (rgb_u8[:, 2].astype(np.uint32))
+            )
+            # cast packed uint32 to float32 bit-pattern (PCL convention)
+            rgb_float = rgb_packed.view(np.float32)
+            for i in range(n):
+                f.write(
+                    f"{xyz[i,0]:.6f} {xyz[i,1]:.6f} {xyz[i,2]:.6f} "
+                    f"{rgb_float[i]:.6e} {int(labels[i])}\n"
+                )
+        else:
+            for i in range(n):
+                f.write(
+                    f"{xyz[i,0]:.6f} {xyz[i,1]:.6f} {xyz[i,2]:.6f} "
+                    f"{int(labels[i])}\n"
+                )
+
+
+# ── Node ───────────────────────────────────────────────────────────────────
+
+class ManualSegmentationNode(Node):
+    def __init__(self) -> None:
+        super().__init__("manual_segmentation_node")
+
+        # Parameters
+        self.declare_parameter("input_topic",  "/scanner/body_cloud")
+        self.declare_parameter("output_topic", "/scanner/segmented_regions")
+        self.declare_parameter("output_dir",   os.path.expanduser("~/ros2_scans"))
+        self.declare_parameter("region_labels", DEFAULT_REGIONS)
+        self.declare_parameter("auto_open_on_stop", True)
+        self.declare_parameter("frame_id",     "base_link")
+
+        self.input_topic_   = self.get_parameter("input_topic").get_parameter_value().string_value
+        self.output_topic_  = self.get_parameter("output_topic").get_parameter_value().string_value
+        self.output_dir_    = self.get_parameter("output_dir").get_parameter_value().string_value
+        self.region_labels_ = list(
+            self.get_parameter("region_labels").get_parameter_value().string_array_value
+        ) or DEFAULT_REGIONS
+        self.auto_open_on_stop_ = self.get_parameter("auto_open_on_stop").get_parameter_value().bool_value
+        self.fallback_frame_id_ = self.get_parameter("frame_id").get_parameter_value().string_value
+
+        # State (guarded by lock)
+        self._lock = threading.Lock()
+        self._latest_msg: Optional[PointCloud2] = None
+        self._open_request = threading.Event()
+        self._open_pending = False  # armed on scan-stop, fired when cloud arrives
+        self._scanning = False
+
+        # Subscribers
+        # body_preprocess_node publishes /scanner/body_cloud exactly once per
+        # scan (on stop) as RELIABLE + TRANSIENT_LOCAL (latched). Match that QoS
+        # so we still receive the latched cloud even if this node connects after
+        # the publish, and so the reliability policies are compatible.
+        body_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            PointCloud2, self.input_topic_, self._cloud_cb, qos_profile=body_qos)
+        self.create_subscription(
+            Bool, "/scanner/is_scanning", self._is_scanning_cb,
+            QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+
+        # Publisher
+        self.pub_ = self.create_publisher(PointCloud2, self.output_topic_, 5)
+
+        # Service: lets the user pop the GUI from CLI
+        # ros2 service call /scanner/open_segmenter std_srvs/srv/Trigger
+        self.create_service(Trigger, "/scanner/open_segmenter",
+                            self._open_segmenter_srv)
+
+        os.makedirs(self.output_dir_, exist_ok=True)
+
+        self.get_logger().info(
+            f"manual_segmentation_node: subscribing {self.input_topic_} -> "
+            f"publishing {self.output_topic_}; "
+            f"output_dir={self.output_dir_}; "
+            f"labels={self.region_labels_}; "
+            f"auto_open_on_stop={self.auto_open_on_stop_}")
+
+    # ── Subscribers ────────────────────────────────────────────────────────
+
+    def _cloud_cb(self, msg: PointCloud2) -> None:
+        with self._lock:
+            self._latest_msg = msg
+            pending = self._open_pending
+            self._open_pending = False
+        # If a scan just stopped and we were waiting for the cleaned body
+        # cloud, this is it — open the editor now that we actually have data.
+        if pending and self.auto_open_on_stop_:
+            self.get_logger().info(
+                "Body cloud received after scan stop — opening segmenter window")
+            self._open_request.set()
+
+    def _is_scanning_cb(self, msg: Bool) -> None:
+        was_scanning = self._scanning
+        self._scanning = bool(msg.data)
+        # Edge: scanning just went True -> False  =>  scan finished.
+        # body_preprocess_node runs RANSAC on stop and publishes the body
+        # cloud a moment later, so we don't open immediately — we arm a
+        # pending flag and let _cloud_cb fire once the cloud arrives. If a
+        # cloud is already cached (e.g. re-stop), open right away.
+        if was_scanning and not self._scanning and self.auto_open_on_stop_:
+            with self._lock:
+                have = self._latest_msg is not None
+                self._open_pending = not have
+            if have:
+                self.get_logger().info(
+                    "Scan finished — body cloud already cached, opening window")
+                self._open_request.set()
+            else:
+                self.get_logger().info(
+                    "Scan finished — waiting for body_preprocess_node cloud …")
+
+    def _open_segmenter_srv(self, request, response):
+        with self._lock:
+            have = self._latest_msg is not None
+        if not have:
+            response.success = False
+            response.message = (
+                f"No body cloud received yet on {self.input_topic_}; "
+                "is body_preprocess_node running?")
+            return response
+        self._open_request.set()
+        response.success = True
+        response.message = "Segmenter window requested"
+        return response
+
+    # ── GUI loop (runs on the main thread) ────────────────────────────────
+
+    def gui_loop_blocking(self) -> None:
+        """Blocking loop for the main thread. Polls _open_request and pops
+        the matplotlib editor when set. matplotlib + Tk both want the main
+        thread, so rclpy.spin() must run on a worker."""
+        plt, Path, PolygonSelector, Button, tk, simpledialog = _import_gui()
+
+        # Hidden Tk root for label dialogs (created once, reused)
+        tk_root = tk.Tk()
+        tk_root.withdraw()
+
+        while rclpy.ok():
+            if not self._open_request.wait(timeout=0.5):
+                continue
+            self._open_request.clear()
+
+            with self._lock:
+                msg = self._latest_msg
+            if msg is None:
+                self.get_logger().warn("Open requested but no cloud cached yet")
+                continue
+
+            try:
+                self._run_editor(msg, plt, Path, PolygonSelector, Button,
+                                 tk_root, simpledialog)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().error(f"Segmentation editor crashed: {exc}")
+
+    def _run_editor(self, msg: PointCloud2, plt, Path, PolygonSelector,
+                    Button, tk_root, simpledialog) -> None:
+        xyz, rgb = _xyzrgb_from_msg(msg)
+        if xyz.shape[0] == 0:
+            self.get_logger().warn("Body cloud is empty — nothing to segment")
+            return
+        frame_id = msg.header.frame_id or self.fallback_frame_id_
+
+        labels = np.zeros(xyz.shape[0], dtype=np.uint8)  # 0 = unlabeled
+
+        # Color used in the scatter: per-point RGB if available,
+        # otherwise viridis on Z so contours are still visible.
+        if rgb is not None:
+            base_colors = rgb.astype(np.float32) / 255.0
+        else:
+            z = xyz[:, 2]
+            zmin, zmax = float(z.min()), float(z.max())
+            denom = max(zmax - zmin, 1e-6)
+            base_colors = plt.cm.viridis((z - zmin) / denom)[:, :3]
+
+        # Active-label state
+        state = {
+            "active_label_id":   1,
+            "active_label_name": self.region_labels_[0] if self.region_labels_ else "region_1",
+            "polygons": [],  # list of (label_id, label_name, vertices Nx2)
+        }
+
+        fig, (ax, ax_legend) = plt.subplots(
+            1, 2, figsize=(12, 8), gridspec_kw={"width_ratios": [4, 1]})
+        fig.canvas.manager.set_window_title(
+            f"Manual Segmentation — frame={frame_id}, points={xyz.shape[0]}")
+
+        # Top-down: X horizontal, Y vertical, equal aspect
+        scatter = ax.scatter(xyz[:, 0], xyz[:, 1], s=2, c=base_colors)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("X (m, base_link)")
+        ax.set_ylabel("Y (m, base_link)")
+        ax.set_title(
+            "Click vertices → close polygon (double-click or Esc to finish).\n"
+            "Pick label below before drawing the next polygon.")
+
+        # Legend / control panel
+        ax_legend.axis("off")
+
+        instructions = (
+            "Controls\n"
+            "──────────\n"
+            "Pick label, then\n"
+            "draw polygon on\n"
+            "the left.\n\n"
+            "Double-click or\n"
+            "Esc to close it.\n\n"
+            "[Undo last]: drop\n"
+            "the last polygon.\n\n"
+            "[New label…]: add\n"
+            "a custom label.\n\n"
+            "[Publish + save]:\n"
+            "apply labels and\n"
+            "write the .pcd."
+        )
+        ax_legend.text(0.0, 1.0, instructions, va="top", ha="left",
+                       family="monospace", fontsize=8)
+
+        # ── Build interactive widgets ─────────────────────────────────────
+        # Pre-allocate axes for the buttons stacked under the legend text
+        max_label_buttons = 12
+        button_axes: List = []
+        button_handles: List = []
+
+        def _refresh_label_buttons():
+            for h in button_handles:
+                h.disconnect_events()
+            button_handles.clear()
+            for ax_ in button_axes:
+                ax_.remove()
+            button_axes.clear()
+
+            n = min(len(self.region_labels_), max_label_buttons)
+            for i in range(n):
+                name = self.region_labels_[i]
+                lid = i + 1
+                color = _make_color(lid)
+                bx = fig.add_axes([0.78, 0.55 - i * 0.04, 0.18, 0.035])
+                btn = Button(bx, f"{lid}: {name}", color=color, hovercolor="white")
+
+                def _make_setter(li=lid, nm=name):
+                    def _set(_evt):
+                        state["active_label_id"]   = li
+                        state["active_label_name"] = nm
+                        ax.set_title(
+                            f"Active label: [{li}] {nm}  —  "
+                            "draw polygon (double-click / Esc to close)")
+                        fig.canvas.draw_idle()
+                    return _set
+
+                btn.on_clicked(_make_setter())
+                button_axes.append(bx)
+                button_handles.append(btn)
+
+        _refresh_label_buttons()
+
+        # Action buttons
+        ax_undo    = fig.add_axes([0.78, 0.10, 0.18, 0.04])
+        ax_newlbl  = fig.add_axes([0.78, 0.05, 0.18, 0.04])
+        ax_publish = fig.add_axes([0.78, 0.00, 0.18, 0.04])
+        btn_undo    = Button(ax_undo,    "Undo last")
+        btn_newlbl  = Button(ax_newlbl,  "New label…")
+        btn_publish = Button(ax_publish, "Publish + save", color="#3CB371",
+                             hovercolor="#90EE90")
+
+        # Persistent overlay artists per polygon
+        overlay_artists: List = []
+
+        def _redraw_overlays():
+            for art in overlay_artists:
+                art.remove()
+            overlay_artists.clear()
+            for lid, _name, verts in state["polygons"]:
+                color = _make_color(lid)
+                vv = np.vstack([verts, verts[:1]])
+                line, = ax.plot(vv[:, 0], vv[:, 1], color=color, linewidth=1.5)
+                fill  = ax.fill(verts[:, 0], verts[:, 1], color=color,
+                                alpha=0.15)[0]
+                overlay_artists.append(line)
+                overlay_artists.append(fill)
+            fig.canvas.draw_idle()
+
+        # Live point recoloring as polygons are committed
+        def _apply_label_for_polygon(verts: np.ndarray, lid: int) -> int:
+            mpl_path = Path(verts)
+            inside = mpl_path.contains_points(xyz[:, :2])
+            n_hit = int(inside.sum())
+            labels[inside] = lid  # last-wins
+            # Recolor scatter so the user sees the labeling immediately
+            new_colors = base_colors.copy()
+            for li in np.unique(labels):
+                if li == 0:
+                    continue
+                mask = labels == li
+                new_colors[mask] = _make_color(int(li))
+            scatter.set_color(new_colors)
+            fig.canvas.draw_idle()
+            return n_hit
+
+        def _on_polygon(verts: List[Tuple[float, float]]):
+            arr = np.asarray(verts, dtype=np.float64)
+            if arr.shape[0] < 3:
+                self.get_logger().warn("Polygon needs >=3 vertices")
+                return
+            lid = state["active_label_id"]
+            name = state["active_label_name"]
+            n_hit = _apply_label_for_polygon(arr, lid)
+            state["polygons"].append((lid, name, arr))
+            self.get_logger().info(
+                f"Polygon committed: label={lid}({name}), "
+                f"vertices={arr.shape[0]}, points_labeled={n_hit}")
+            _redraw_overlays()
+
+        # PolygonSelector wants a 2-arg signature on (xs, ys)
+        selector = PolygonSelector(ax, _on_polygon, useblit=True,
+                                   props=dict(color="white", linewidth=1.5))
+
+        # ── Button callbacks ───────────────────────────────────────────────
+        def _on_undo(_evt):
+            if not state["polygons"]:
+                return
+            state["polygons"].pop()
+            # Recompute labels from scratch (last-wins semantics)
+            labels[:] = 0
+            for lid, _name, verts in state["polygons"]:
+                _apply_label_for_polygon(verts, lid)
+            _redraw_overlays()
+
+        def _on_new_label(_evt):
+            new_name = simpledialog.askstring(
+                "New label", "Label name:", parent=tk_root)
+            if not new_name:
+                return
+            new_name = new_name.strip().replace(" ", "_")
+            if not new_name:
+                return
+            if len(self.region_labels_) >= max_label_buttons:
+                self.get_logger().warn(
+                    f"Max {max_label_buttons} labels reached — drop one first")
+                return
+            self.region_labels_.append(new_name)
+            _refresh_label_buttons()
+            fig.canvas.draw_idle()
+
+        def _on_publish(_evt):
+            try:
+                self._publish_and_save(msg, xyz, rgb, labels, state["polygons"],
+                                       frame_id)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().error(f"Publish/save failed: {exc}")
+
+        btn_undo.on_clicked(_on_undo)
+        btn_newlbl.on_clicked(_on_new_label)
+        btn_publish.on_clicked(_on_publish)
+
+        # Keep references alive (matplotlib drops weak refs to widgets)
+        # by stashing them on the figure.
+        fig._kept = (selector, btn_undo, btn_newlbl, btn_publish, button_handles)
+
+        ax.set_title(
+            f"Active label: [1] {state['active_label_name']}  —  "
+            "draw polygon (double-click / Esc to close)")
+
+        # Modal show. matplotlib returns when the user closes the window.
+        plt.show()
+
+    def _publish_and_save(
+        self,
+        msg: PointCloud2,
+        xyz: np.ndarray,
+        rgb: Optional[np.ndarray],
+        labels: np.ndarray,
+        polygons: List[Tuple[int, str, np.ndarray]],
+        frame_id: str,
+    ) -> None:
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = frame_id
+
+        out_msg = _build_labeled_cloud(header, xyz, rgb, labels)
+        self.pub_.publish(out_msg)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        os.makedirs(self.output_dir_, exist_ok=True)
+        pcd_path = os.path.join(self.output_dir_, f"regions_{ts}.pcd")
+        _save_pcd_ascii_with_label(pcd_path, xyz, rgb, labels)
+
+        # Sidecar JSON with polygon definitions, so the user (and future
+        # reviewers) can replay the exact selection later.
+        import json
+        sidecar = {
+            "frame_id": frame_id,
+            "timestamp": ts,
+            "labels": [
+                {"id": int(lid), "name": name,
+                 "vertices": np.asarray(verts).tolist()}
+                for (lid, name, verts) in polygons
+            ],
+            "label_counts": {
+                str(int(li)): int(np.sum(labels == li))
+                for li in np.unique(labels)
+            },
+            "total_points": int(xyz.shape[0]),
+        }
+        with open(pcd_path.replace(".pcd", ".json"), "w") as f:
+            json.dump(sidecar, f, indent=2)
+
+        self.get_logger().info(
+            f"Published {xyz.shape[0]} labeled pts to {self.output_topic_} | "
+            f"saved -> {pcd_path}")
+
+
+# ── Entry point ────────────────────────────────────────────────────────────
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = ManualSegmentationNode()
+
+    # rclpy spinning runs on a worker thread; matplotlib needs the main thread.
+    spinner = threading.Thread(
+        target=rclpy.spin, args=(node,), name="rclpy_spin", daemon=True)
+    spinner.start()
+
+    try:
+        node.gui_loop_blocking()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        spinner.join(timeout=1.0)
+
+
+if __name__ == "__main__":
+    main()

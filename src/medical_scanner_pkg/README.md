@@ -38,10 +38,10 @@ sudo apt install -y \
 
 ## 2. Build
 
-From workspace root (example `~/ros2_ws`):
+From workspace root (`~/Documents/ros2_ws`):
 
 ```bash
-cd ~/ros2_ws
+cd ~/Documents/ros2_ws
 colcon build --packages-select medical_scanner_pkg
 source install/setup.bash
 ```
@@ -289,7 +289,7 @@ Expected fixed frame:
 ### Package executable not found
 
 ```bash
-cd ~/ros2_ws
+cd ~/Documents/ros2_ws
 colcon build --packages-select medical_scanner_pkg
 source install/setup.bash
 ros2 pkg executables medical_scanner_pkg

@@ -48,6 +48,8 @@ private:
   // params
   std::string optical_frame_;
   std::string output_dir_;
+  std::string image_topic_;
+  std::string camera_info_topic_;
   int         queue_size_;
   double      approx_time_slop_;
 

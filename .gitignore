@@ -3,12 +3,16 @@ build/
 install/
 log/
 
+# Heavy experiment (not part of the system)
+src/massage_points/
+
 # Python
 __pycache__/
 *.py[cod]
 *.pyo
 *.so
 .pytest_cache/
+*.venv/
 
 # Exclude rplidar_ros (managed separately)
 src/rplidar_ros/
@@ -17,3 +21,25 @@ src/rplidar_ros/
 .vscode/
 .idea/
 .DS_Store
+
+# Tool/agent directories
+.commandcode/
+.gemini/
+.hermes/
+.claude/
+
+# Tool/agent config files
+CLAUDE.md
+GEMINI.md
+
+# Experimental / bridge
+ai_bridge/
+graphify-out/
+
+# Test data
+*.pcd
+*.ply
+
+# Temp
+*/cache/*
+*.bak
