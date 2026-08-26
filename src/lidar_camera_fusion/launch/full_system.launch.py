@@ -102,7 +102,7 @@ def generate_launch_description():
         # ── Camera ─────────────────────────────────────────────────────────
         DeclareLaunchArgument(
             'camera_info_url',
-            default_value='file:///home/azzam/Documents/webcam_calibration.yaml',
+            default_value='file:///home/gin/scanner-system/webcam_calibration.yaml',
             description='URL to the camera calibration YAML '
                         '(file:///absolute/path.yaml or package://...)'),
         DeclareLaunchArgument(
