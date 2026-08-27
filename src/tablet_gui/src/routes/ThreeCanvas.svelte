@@ -34,10 +34,6 @@
   });
 
   function updatePointCloud(msg) {
-    if (pointCloudObject) {
-      scene.remove(pointCloudObject);
-    }
-
     // rosbridge sends PointCloud2.data as a base64-encoded string, not a byte array.
     // Decode it to a Uint8Array before wrapping in DataView.
     let rawBytes;
@@ -56,8 +52,6 @@
     const pointStep = msg.point_step;
     const numPoints = Math.floor(rawBytes.byteLength / pointStep);
 
-    // Parse standard PointCloud2 binary data
-    const geometry = new THREE.BufferGeometry();
     const positions = [];
     const colors = [];
 
@@ -94,18 +88,29 @@
       }
     }
 
-    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    // Reuse pointCloudObject geometry and material to prevent V8 GC / GPU memory leaks
+    if (!pointCloudObject) {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
 
-    const material = new THREE.PointsMaterial({
-      size: 0.015,
-      vertexColors: true,
-      transparent: true,
-      opacity: 0.8
-    });
+      const material = new THREE.PointsMaterial({
+        size: 0.015,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.8
+      });
 
-    pointCloudObject = new THREE.Points(geometry, material);
-    scene.add(pointCloudObject);
+      pointCloudObject = new THREE.Points(geometry, material);
+      scene.add(pointCloudObject);
+    } else {
+      const geom = pointCloudObject.geometry;
+      geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+      geom.attributes.position.needsUpdate = true;
+      geom.attributes.color.needsUpdate = true;
+      geom.computeBoundingSphere();
+    }
   }
 
   // Monitor landmark changes to render interactive spheres
@@ -114,12 +119,16 @@
   }
 
   function renderLandmarks(landmarks) {
-    // Clear old spheres
-    landmarkSpheres.forEach(s => scene.remove(s));
+    // Clear old spheres and dispose WebGL resources
+    landmarkSpheres.forEach(s => {
+      scene.remove(s);
+      if (s.geometry) s.geometry.dispose();
+      if (s.material) s.material.dispose();
+    });
     landmarkSpheres = [];
 
     landmarks.forEach((pt, index) => {
-      const geom = new THREE.SphereGeometry(0.04, 32, 32); // 4cm radius sphere
+      const geom = new THREE.SphereGeometry(0.04, 16, 16); // Reduced segments for memory optimization
       const isSelected = selectedPointIndices.includes(index);
       const mat = new THREE.MeshBasicMaterial({
         color: isSelected ? 0x27ae60 : 0x7f8c8d // Green for selected, Gray/Silver otherwise
@@ -239,8 +248,18 @@
 
   onDestroy(() => {
     cancelAnimationFrame(frameId);
+    window.removeEventListener('resize', handleResize);
     unsubscribePos();
     unsubscribeCloud();
+    if (pointCloudObject) {
+      if (pointCloudObject.geometry) pointCloudObject.geometry.dispose();
+      if (pointCloudObject.material) pointCloudObject.material.dispose();
+    }
+    landmarkSpheres.forEach(s => {
+      if (s.geometry) s.geometry.dispose();
+      if (s.material) s.material.dispose();
+    });
+    landmarkSpheres = [];
     if (controls) controls.dispose();
     if (renderer) renderer.dispose();
   });
