@@ -18,7 +18,7 @@ for arg in "$@"; do
 done
 
 WORKSPACE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-
+cd "$WORKSPACE_DIR"
 # ---- colour helpers ----
 RED=$(tput setaf 1 2>/dev/null || echo '')
 GREEN=$(tput setaf 2 2>/dev/null || echo '')
