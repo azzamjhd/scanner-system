@@ -123,7 +123,9 @@ Place your `.yaml` calibration file at:
 ~/.ros/camera_info/c922_pro_stream_webcam.yaml
 ```
 
-Or set `camera_info_url` in the launch arguments (default: `file:///home/azzam/Documents/webcam_calibration.yaml`).
+The default launch configuration uses the package-installed calibration file.
+For a different camera, override `camera_info_url` with a `file:///` or
+`package://` URL.
 
 ## Troubleshooting
 

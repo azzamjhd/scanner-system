@@ -167,6 +167,11 @@ install(DIRECTORY urdf/
   DESTINATION share/${PROJECT_NAME}/urdf
 )
 
+install(FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../webcam_calibration.yaml
+  DESTINATION share/${PROJECT_NAME}/config
+)
+
 # ─── Python scripts ─────────────────────────────────────────────────────────
 install(PROGRAMS
   scripts/scan_image_recorder_node
