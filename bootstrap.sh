@@ -7,7 +7,7 @@
 #   git clone https://github.com/azzamjhd/scanner-system.git ~/scanner_ws
 #   cd ~/scanner_ws && ./bootstrap.sh
 #
-set -euo pipefail
+# set -euo pipefail
 
 # ---- parse arguments ----
 HEADLESS=false
