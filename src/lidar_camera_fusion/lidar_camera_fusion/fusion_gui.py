@@ -3,15 +3,19 @@ fusion_gui.py
 =============
 PyQt5 control GUI for the lidar_camera_fusion package.
 
-Single window, four panels:
+Single window, five panels:
   1. Node status (heartbeat-based, polled at 2 Hz)
   2. Sweep control (Start/Stop with state machine)
-  3. Auto-discovered parameters for scan_assembler_node and cloud_colorizer_node
-  4. /rosout log viewer (all nodes)
+  3. Bag recording (ros2 bag record for dashboard replay)
+  4. Auto-discovered parameters for scan_assembler_node and cloud_colorizer_node
+  5. /rosout log viewer (all nodes)
 """
 from __future__ import annotations
 
 import datetime as dt
+import os
+import signal
+import subprocess
 import sys
 from typing import Dict, List, Optional
 
@@ -127,12 +131,13 @@ class FusionMainWindow(QMainWindow):
         top_split = QSplitter(Qt.Horizontal)
         root.addWidget(top_split, 1)
 
-        # left column: status + sweep
+        # left column: status + sweep + bag
         left_col = QWidget()
         left_lay = QVBoxLayout(left_col)
         left_lay.setContentsMargins(0, 0, 0, 0)
         left_lay.addWidget(self._build_status_panel())
         left_lay.addWidget(self._build_sweep_panel())
+        left_lay.addWidget(self._build_bag_panel())
         left_lay.addStretch(1)
         top_split.addWidget(left_col)
 
@@ -257,6 +262,63 @@ class FusionMainWindow(QMainWindow):
         btn_row.addWidget(self.btn_stop)
         btn_row.addWidget(self.btn_clear)
         lay.addLayout(btn_row)
+
+        return box
+
+    def _build_bag_panel(self) -> QGroupBox:
+        box = QGroupBox("Bag recording (for dashboard replay)")
+        lay = QVBoxLayout(box)
+
+        # topic list
+        topics = [
+            "/scan",
+            "/current_position",
+            "/joint_states",
+            "/scanner/assembled_cloud",
+            "/scanner/colored_cloud",
+            "/image_raw",
+            "/camera_info",
+            "/tf",
+            "/tf_static",
+            "/scanner/is_scanning",
+        ]
+        topic_text = " ".join(topics)
+        lbl_topics = QLabel("Topics:")
+        lbl_topics.setStyleSheet("color: #6b7280;")
+        lay.addWidget(lbl_topics)
+        txt_topics = QPlainTextEdit(topic_text)
+        txt_topics.setReadOnly(True)
+        txt_topics.setMaximumHeight(60)
+        txt_topics.setFont(QFont("Monospace", 8))
+        lay.addWidget(txt_topics)
+
+        # output dir
+        form = QFormLayout()
+        self.le_bag_dir = QLineEdit()
+        default_dir = os.path.expanduser("~/rosbags")
+        self.le_bag_dir.setText(default_dir)
+        form.addRow("Output dir:", self.le_bag_dir)
+        lay.addLayout(form)
+
+        # buttons
+        btn_row = QHBoxLayout()
+        self.btn_bag_start = QPushButton("Start recording")
+        self.btn_bag_stop = QPushButton("Stop recording")
+        self.btn_bag_stop.setEnabled(False)
+        self.btn_bag_start.clicked.connect(self._on_bag_start_clicked)
+        self.btn_bag_stop.clicked.connect(self._on_bag_stop_clicked)
+        btn_row.addWidget(self.btn_bag_start)
+        btn_row.addWidget(self.btn_bag_stop)
+        lay.addLayout(btn_row)
+
+        # status label
+        self.lbl_bag_status = QLabel("Status: idle")
+        self.lbl_bag_status.setStyleSheet("color: #6b7280;")
+        lay.addWidget(self.lbl_bag_status)
+
+        # internal state
+        self._bag_proc: Optional[subprocess.Popen] = None
+        self._bag_path: Optional[str] = None
 
         return box
 
@@ -484,6 +546,80 @@ class FusionMainWindow(QMainWindow):
             return
         self.node.call_trigger(self.node.SVC_CLEAR)
 
+    # ── Bag recording ─────────────────────────────────────────────────────────
+
+    def _on_bag_start_clicked(self) -> None:
+        """Start ros2 bag record subprocess."""
+        if self._bag_proc is not None:
+            self._append_log(Log.WARN, "fusion_gui", "Already recording")
+            return
+
+        topics = [
+            "/scan",
+            "/current_position",
+            "/joint_states",
+            "/scanner/assembled_cloud",
+            "/scanner/colored_cloud",
+            "/image_raw",
+            "/camera_info",
+            "/tf",
+            "/tf_static",
+            "/scanner/is_scanning",
+        ]
+
+        output_dir = self.le_bag_dir.text().strip() or os.path.expanduser("~/rosbags")
+        os.makedirs(output_dir, exist_ok=True)
+
+        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        bag_name = f"scan_session_{timestamp}"
+        bag_path = os.path.join(output_dir, bag_name)
+
+        # Use a shell with sourced ROS env
+        shell_cmd = (
+            f"source /opt/ros/jazzy/setup.bash && "
+            f"source {os.path.expanduser('~/scanner-system/install/setup.bash')} && "
+            f"ros2 bag record {' '.join(topics)} -o {bag_path}"
+        )
+
+        self._bag_proc = subprocess.Popen(
+            ["bash", "-c", shell_cmd],
+            preexec_fn=os.setsid,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self._bag_path = bag_path
+        self.btn_bag_start.setEnabled(False)
+        self.btn_bag_stop.setEnabled(True)
+        self.lbl_bag_status.setText(f"Status: recording → {bag_path}")
+        self.lbl_bag_status.setStyleSheet("color: #22c55e;")
+        self._append_log(Log.INFO, "fusion_gui", f"Started bag recording: {bag_path}")
+
+    def _on_bag_stop_clicked(self) -> None:
+        """Stop ros2 bag record subprocess gracefully."""
+        if self._bag_proc is None:
+            self._append_log(Log.WARN, "fusion_gui", "Not recording")
+            return
+
+        try:
+            # Send SIGINT to the process group for clean shutdown
+            os.killpg(os.getpgid(self._bag_proc.pid), signal.SIGINT)
+            self._bag_proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            os.killpg(os.getpgid(self._bag_proc.pid), signal.SIGKILL)
+            self._bag_proc.wait()
+            self._append_log(Log.WARN, "fusion_gui", "Bag process killed after timeout")
+        except Exception as ex:  # noqa: BLE001
+            self._append_log(Log.ERROR, "fusion_gui", f"Error stopping bag: {ex}")
+
+        self._append_log(Log.INFO, "fusion_gui", f"Stopped bag recording: {self._bag_path}")
+        self._bag_proc = None
+        self._bag_path = None
+        self.btn_bag_start.setEnabled(True)
+        self.btn_bag_stop.setEnabled(False)
+        self.lbl_bag_status.setText("Status: idle")
+        self.lbl_bag_status.setStyleSheet("color: #6b7280;")
+
     # ── Param discovery ─────────────────────────────────────────────────────
 
     def _discover(self, node_name: str) -> None:
@@ -656,6 +792,9 @@ class FusionMainWindow(QMainWindow):
         try:
             if self.node is not None and self.node.sweep_busy():
                 self.node.cancel_sweep()
+            # Stop bag recording if active
+            if self._bag_proc is not None:
+                self._on_bag_stop_clicked()
         finally:
             self.worker.shutdown()
             super().closeEvent(event)

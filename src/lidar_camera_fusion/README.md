@@ -320,7 +320,7 @@ cloud_colorizer + scan_image_recorder, +2 s), and the segmentation pipeline
 Key arguments (defaults in parentheses): `mcu_port` (/dev/ttyUSB0),
 `lidar_port` (/dev/ttyUSB1), `camera_device` (/dev/video0), `scan_mode`
 (Boost), `camera_info_url`
-(file:///home/azzam/Documents/webcam_calibration.yaml), `output_dir`
+(package-installed `webcam_calibration.yaml`), `output_dir`
 (~/ros2_scans), `max_points` (500000), `publish_rate` (2.0). Sweep:
 `scan_start_mm` (0.0), `scan_end_mm` (300.0), `scan_speed_mm_s` (20.0).
 Recorder: `use_lidar_distance` (true), `undistort_images` (true),
