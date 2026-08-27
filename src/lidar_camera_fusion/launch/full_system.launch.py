@@ -108,7 +108,7 @@ def generate_launch_description():
             'camera_info_url',
             default_value=default_camera_info_url,
             description='URL to the camera calibration YAML '
-                        '(file:///absolute/path.yaml or package://...)'),
+                        '(package://lidar_camera_fusion/config/webcam_calibration.yaml or file:///absolute/path.yaml)'),
         DeclareLaunchArgument(
             'camera_frame_id',
             default_value='camera_optical_frame',

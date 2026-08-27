@@ -1,0 +1,26 @@
+image_width: 640
+image_height: 480
+camera_name: c922_pro_stream_webcam
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [651.038696,   0.000000, 332.072287,
+           0.000000, 653.055391, 267.237993,
+           0.000000,   0.000000,   1.000000]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [0.024331, -0.059238, 0.022715, 0.009318, 0.000000]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1.000000, 0.000000, 0.000000,
+         0.000000, 1.000000, 0.000000,
+         0.000000, 0.000000, 1.000000]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [660.250556,   0.000000, 337.006705, 0.000000,
+           0.000000, 656.786303, 275.565514, 0.000000,
+           0.000000,   0.000000,   1.000000, 0.000000]

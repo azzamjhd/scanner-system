@@ -16,17 +16,49 @@ cd ~/scanner_ws
 # 2. One command to pull external deps, install everything, and build
 ./bootstrap.sh
 
-# 3. Run
+# 3. Run (Desktop GUI mode)
 source install/setup.bash
 ros2 launch lidar_camera_fusion full_system.launch.py
 ```
+
+## Headless Bringup & TUI Control (SBC / SSH / Raspberry Pi / Jetson)
+
+To run the scanning system on a headless board (e.g., Raspberry Pi 4B, Jetson Nano) through SSH:
+
+### 1. Build without GUI dependencies
+You can skip installing graphical packages (PyQt5, PyQtGraph, etc.) during setup using `rosdep`:
+```bash
+rosdep install --from-paths src --ignore-src -y --skip-keys "python3-pyqt5 python3-pyqtgraph python3-matplotlib python3-tk"
+colcon build --symlink-install --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3
+```
+
+### 2. Start the headless hardware nodes
+Run the low-resource hardware-only launch file. By default, this starts the micro-ROS agent, RPLiDAR driver, state publisher, scan cycle orchestrator, and assembler, but keeps the camera disabled to save CPU and RAM:
+```bash
+source install/setup.bash
+ros2 launch lidar_camera_fusion hardware_only.launch.py enable_camera:=false
+```
+
+### 3. Open the SSH Curses TUI Control Panel
+In a new SSH terminal window, run the curses TUI to monitor status, view live logs, and execute sweeps:
+```bash
+source install/setup.bash
+ros2 run lidar_camera_fusion fusion_tui
+```
+
+* **TUI Shortcuts:**
+  * `[S]` Start Sweep (instant command with current settings)
+  * `[P]` Edit Parameters (Start Pos, End Pos, Speed, Tolerance, Timeout)
+  * `[C]` Cancel Sweep / Halt Gantry
+  * `[X]` Clear Point Cloud
+  * `[Q]` Quit TUI (will safely halt gantry in place first)
 
 ## What bootstrap.sh does
 
 0. Installs `python3-vcstool` and runs `vcs import src < scanner_system.repos` to pull `rplidar_ros`
 1. Installs ROS 2 Jazzy (if absent)
 2. Runs `rosdep install` for all ROS-level dependencies
-3. Installs system packages: PCL, OpenCV, NumPy, SciPy, Matplotlib, Tk, PyQt5, PyQtGraph, PyQt6
+3. Installs system packages: PCL, OpenCV, NumPy, SciPy, Matplotlib, Tk, PyQt5, PyQtGraph, PyQt6, `python3-venv`
 4. Creates a Python `.venv` with `numpy<2` + `mediapipe` (isolated — won't break system packages)
 5. Patches `rplidar_ros` with the A1 `angle_max` fix (359° → 360°)
 6. Builds the workspace with `colcon build --symlink-install`
@@ -35,7 +67,7 @@ ros2 launch lidar_camera_fusion full_system.launch.py
 
 | Package | Type | What it does |
 |---|---|---|
-| `lidar_camera_fusion` | C++/Python hybrid | 3D scanner assembler, colorizer, body segmentation, GUI |
+| `lidar_camera_fusion` | C++/Python hybrid | 3D scanner assembler, colorizer, body segmentation, GUI & TUI |
 | `medical_scanner_pkg` | Python | Original scanner node + PyQt5 mission-control GUI |
 | `gantry_image_stitcher` | Python | Distance-triggered camera frame capture + OpenCV stitching |
 | `massage_perception` | Python | MediaPipe BlazePose landmark detection → massage points |
