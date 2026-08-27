@@ -61,7 +61,8 @@ function subscribeToTelemetry() {
   cloudSub = new ROSLIB.Topic({
     ros: rosClient,
     name: '/point_cloud/downsampled',
-    messageType: 'sensor_msgs/PointCloud2'
+    messageType: 'sensor_msgs/PointCloud2',
+    throttle_rate: 250 // Throttle websocket JSON payload rate (max ~4 fps) to avoid blocking JS event loop
   });
 
   cloudSub.subscribe((message) => {

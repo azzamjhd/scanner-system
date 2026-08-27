@@ -404,5 +404,6 @@ lidar_camera_fusion/
     ├── full_system.launch.py                everything, single command
     ├── fusion.launch.py                     rectify + assembler + colorizer + recorder
     ├── segmentation.launch.py               body_preprocess + manual_segmentation
-    └── scanner_bridge.launch.py             robot_state_publisher only
+    ├── scanner_bridge.launch.py             robot_state_publisher only
+    └── replay.launch.py                     offline rosbag replay + rosbridge for tablet GUI
 ```

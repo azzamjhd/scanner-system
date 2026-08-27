@@ -1,13 +1,14 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
   import * as THREE from 'three';
+  import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
   import { livePointCloud, gantryPosition } from '../lib/ros.js';
 
   export let selectedPointIndices = [];
   export let detectedLandmarks = [];
 
   let canvasContainer;
-  let scene, camera, renderer;
+  let scene, camera, renderer, controls;
   let pointCloudObject = null;
   let landmarkSpheres = [];
   let frameId;
@@ -23,8 +24,12 @@
     }
   });
 
+  let lastCloudUpdateTime = 0;
   const unsubscribeCloud = livePointCloud.subscribe(pcdMsg => {
     if (!pcdMsg || !scene) return;
+    const now = performance.now();
+    if (now - lastCloudUpdateTime < 200) return; // Limit geometry rebuilds to max 5 Hz
+    lastCloudUpdateTime = now;
     updatePointCloud(pcdMsg);
   });
 
@@ -33,18 +38,30 @@
       scene.remove(pointCloudObject);
     }
 
+    // rosbridge sends PointCloud2.data as a base64-encoded string, not a byte array.
+    // Decode it to a Uint8Array before wrapping in DataView.
+    let rawBytes;
+    if (typeof msg.data === 'string') {
+      const binaryStr = atob(msg.data);
+      rawBytes = new Uint8Array(binaryStr.length);
+      for (let i = 0; i < binaryStr.length; i++) {
+        rawBytes[i] = binaryStr.charCodeAt(i);
+      }
+    } else {
+      // Fallback if already an array (shouldn't happen via rosbridge JSON)
+      rawBytes = new Uint8Array(msg.data);
+    }
+
+    const dataView = new DataView(rawBytes.buffer);
+    const pointStep = msg.point_step;
+    const numPoints = Math.floor(rawBytes.byteLength / pointStep);
+
     // Parse standard PointCloud2 binary data
     const geometry = new THREE.BufferGeometry();
     const positions = [];
     const colors = [];
 
-    // Fields parser: x, y, z are float32
-    // Inside ROS PointCloud2 message format: data is uint8 array
-    const dataView = new DataView(new Uint8Array(msg.data).buffer);
-    const pointStep = msg.point_step;
-    const numPoints = msg.data.length / pointStep;
-
-    // Retrieve offsets
+    // Retrieve field offsets
     let xOffset = 0, yOffset = 4, zOffset = 8, rgbOffset = -1;
     for (let f of msg.fields) {
       if (f.name === 'x') xOffset = f.offset;
@@ -55,23 +72,25 @@
 
     for (let i = 0; i < numPoints; i++) {
       const base = i * pointStep;
-      if (base + 12 > msg.data.length) break;
+      if (base + zOffset + 4 > rawBytes.byteLength) break;
 
       const x = dataView.getFloat32(base + xOffset, true);
       const y = dataView.getFloat32(base + yOffset, true);
       const z = dataView.getFloat32(base + zOffset, true);
 
+      // Skip NaN points (common in sparse scans)
+      if (!isFinite(x) || !isFinite(y) || !isFinite(z)) continue;
+
       positions.push(x, y, z);
 
-      if (rgbOffset !== -1 && base + rgbOffset + 4 <= msg.data.length) {
-        // Extract color components
+      if (rgbOffset !== -1 && base + rgbOffset + 4 <= rawBytes.byteLength) {
         const rgbVal = dataView.getUint32(base + rgbOffset, true);
         const r = ((rgbVal >> 16) & 0xff) / 255.0;
         const g = ((rgbVal >> 8) & 0xff) / 255.0;
         const b = (rgbVal & 0xff) / 255.0;
         colors.push(r, g, b);
       } else {
-        colors.push(0.5, 0.7, 1.0); // Default blueish tint
+        colors.push(0.5, 0.7, 1.0);
       }
     }
 
@@ -115,18 +134,34 @@
     });
   }
 
-  function handleTouch(event) {
+  let pointerStartPos = { x: 0, y: 0 };
+
+  function handlePointerDown(event) {
+    const touch = event.touches ? event.touches[0] : event;
+    pointerStartPos = { x: touch.clientX, y: touch.clientY };
+  }
+
+  function handleClick(event) {
     if (!renderer || !camera) return;
 
-    // Handle touch coordinate mapping
+    const touch = event.changedTouches ? event.changedTouches[0] : event;
+    const clientX = touch ? touch.clientX : event.clientX;
+    const clientY = touch ? touch.clientY : event.clientY;
+
+    const dx = clientX - pointerStartPos.x;
+    const dy = clientY - pointerStartPos.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    // Only trigger landmark raycast if it was a tap/click without dragging (dist <= 10px)
+    if (dist > 10) return;
+
     const rect = renderer.domElement.getBoundingClientRect();
-    const touch = event.touches ? event.touches[0] : event;
-    const clientX = touch.clientX - rect.left;
-    const clientY = touch.clientY - rect.top;
+    const relX = clientX - rect.left;
+    const relY = clientY - rect.top;
 
     const mouse = new THREE.Vector2(
-      (clientX / rect.width) * 2 - 1,
-      -(clientY / rect.height) * 2 + 1
+      (relX / rect.width) * 2 - 1,
+      -(relY / rect.height) * 2 + 1
     );
 
     const raycaster = new THREE.Raycaster();
@@ -146,6 +181,13 @@
     }
   }
 
+  export function resetCamera() {
+    if (!camera || !controls) return;
+    camera.position.set(0, -1.8, 1.8);
+    controls.target.set(0, 0, 0);
+    controls.update();
+  }
+
   onMount(() => {
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0e0e0e);
@@ -157,6 +199,15 @@
     renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(canvasContainer.clientWidth, canvasContainer.clientHeight);
     canvasContainer.appendChild(renderer.domElement);
+
+    // OrbitControls setup
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.screenSpacePanning = true;
+    controls.maxPolarAngle = Math.PI / 2 + 0.1;
+    controls.target.set(0, 0, 0);
+    controls.update();
 
     // Bed plane visualization grid
     const grid = new THREE.GridHelper(3.0, 30, 0x34495e, 0x1d2731);
@@ -171,6 +222,7 @@
 
     const animate = () => {
       frameId = requestAnimationFrame(animate);
+      if (controls) controls.update();
       renderer.render(scene, camera);
     };
     animate();
@@ -189,6 +241,7 @@
     cancelAnimationFrame(frameId);
     unsubscribePos();
     unsubscribeCloud();
+    if (controls) controls.dispose();
     if (renderer) renderer.dispose();
   });
 </script>
@@ -197,9 +250,13 @@
 <div 
   bind:this={canvasContainer} 
   class="canvas-wrapper" 
-  on:touchstart={handleTouch}
-  on:mousedown={handleTouch}
-></div>
+  on:pointerdown={handlePointerDown}
+  on:click={handleClick}
+>
+  <button class="reset-cam-btn" on:click|stopPropagation={resetCamera} title="Reset 3D View">
+    🎯 Reset View
+  </button>
+</div>
 
 <style>
   .canvas-wrapper {
@@ -209,5 +266,28 @@
     border-radius: 12px;
     border: 1px solid #2d2d2d;
     box-shadow: inset 0 0 10px rgba(0,0,0,0.5);
+    overflow: hidden;
+  }
+
+  .reset-cam-btn {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    background: rgba(30, 30, 30, 0.85);
+    color: #e0e0e0;
+    border: 1px solid #444;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    backdrop-filter: blur(4px);
+    transition: background 0.2s, border-color 0.2s;
+    z-index: 10;
+  }
+
+  .reset-cam-btn:hover {
+    background: rgba(50, 50, 50, 0.95);
+    border-color: #3498db;
+    color: #ffffff;
   }
 </style>
