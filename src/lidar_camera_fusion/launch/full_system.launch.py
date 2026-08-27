@@ -23,7 +23,7 @@ ros2 launch lidar_camera_fusion full_system.launch.py
 
 # Override anything
 ros2 launch lidar_camera_fusion full_system.launch.py \\
-    output_dir:=/home/azzam/scans \\
+    output_dir:=~/scans \\
     max_points:=1000000
 
 Scan workflow (CLI)
@@ -35,6 +35,7 @@ ros2 service call /scanner/stop  std_srvs/srv/Trigger
 """
 
 import os
+from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -56,6 +57,9 @@ def generate_launch_description():
 
     # ── Package share paths ────────────────────────────────────────────────
     fusion_share = get_package_share_directory('lidar_camera_fusion')
+    default_camera_info_url = Path(
+        os.path.join(fusion_share, 'config', 'webcam_calibration.yaml')
+    ).as_uri()
 
     # ── Launch arguments ───────────────────────────────────────────────────
     args = [
@@ -102,7 +106,7 @@ def generate_launch_description():
         # ── Camera ─────────────────────────────────────────────────────────
         DeclareLaunchArgument(
             'camera_info_url',
-            default_value='file:///home/gin/scanner-system/webcam_calibration.yaml',
+            default_value=default_camera_info_url,
             description='URL to the camera calibration YAML '
                         '(file:///absolute/path.yaml or package://...)'),
         DeclareLaunchArgument(
