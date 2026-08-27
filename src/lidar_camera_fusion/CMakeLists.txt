@@ -168,7 +168,8 @@ install(DIRECTORY urdf/
   DESTINATION share/${PROJECT_NAME}/urdf
 )
 
-install(DIRECTORY config/
+install(FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../webcam_calibration.yaml
   DESTINATION share/${PROJECT_NAME}/config
 )
 
