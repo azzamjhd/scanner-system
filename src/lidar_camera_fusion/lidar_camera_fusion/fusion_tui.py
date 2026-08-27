@@ -54,11 +54,11 @@ class FusionTUI:
 
         # Wire signals from ROS Bridge
         self.bridge.is_scanning_changed.connect(self._on_is_scanning)
-        self.bridge.position_heartbeat .connect(self._on_position)
-        self.bridge.service_result     .connect(self._on_service_result)
+        self.bridge.position_heartbeat.connect(self._on_position)
+        self.bridge.service_result.connect(self._on_service_result)
         self.bridge.sweep_state_changed.connect(self._on_sweep_state)
-        self.bridge.rosout             .connect(self._on_rosout)
-        self.bridge.log                .connect(self._on_internal_log)
+        self.bridge.rosout.connect(self._on_rosout)
+        self.bridge.log.connect(self._on_internal_log)
 
     def _on_is_scanning(self, scanning: bool) -> None:
         self._is_scanning = scanning
