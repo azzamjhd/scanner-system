@@ -14,8 +14,8 @@
   // Config parameters
   let bridgeUrl = 'ws://localhost:9090';
   let startMm = 0.0;
-  let endMm = 600.0;
-  let speedMms = 35.0;
+  let endMm = 1650.0;
+  let speedMms = 30.0;
 
   let forceLimitN = 15.0;
   let massagePattern = 'linear';
@@ -120,15 +120,15 @@
       <h3>Scan Setup</h3>
       <div class="form-group">
         <label>Start Pos (mm): {startMm}</label>
-        <input type="range" min="0" max="1500" step="50" bind:value={startMm} disabled={isScanning} />
+        <input type="range" min="0" max="1650" step="50" bind:value={startMm} disabled={isScanning} />
       </div>
       <div class="form-group">
         <label>End Pos (mm): {endMm}</label>
-        <input type="range" min="100" max="2000" step="50" bind:value={endMm} disabled={isScanning} />
+        <input type="range" min="0" max="1650" step="50" bind:value={endMm} disabled={isScanning} />
       </div>
       <div class="form-group">
         <label>Speed (mm/s): {speedMms}</label>
-        <input type="range" min="10" max="100" step="5" bind:value={speedMms} disabled={isScanning} />
+        <input type="range" min="10" max="80" step="2" bind:value={speedMms} disabled={isScanning} />
       </div>
 
       {#if !isScanning}
@@ -279,7 +279,7 @@
   .btn-success { background-color: #2ecc71; color: #fff; }
   .btn-warning { background-color: #f39c12; color: #fff; }
   .btn-danger { background-color: #e74c3c; color: #fff; }
-  .btn-connect { background-color: #7f8c8d; color: #fff; margin-top: 5px; }
+  .btn-connect { background-color: #2ecc71; color: #fff; margin-top: 5px; }
 
   .btn:disabled {
     opacity: 0.4;
