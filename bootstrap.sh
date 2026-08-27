@@ -135,8 +135,8 @@ if ! grep -q "source /opt/ros/.*setup.bash" ~/.bashrc; then
   echo "source /opt/ros/\$ROS_DISTRO/setup.bash" >> ~/.bashrc
 fi
 
-if ! grep -q "source $WORKSPACE_DIR/install/local_setup.bash" ~/.bashrc; then
-  echo "source $WORKSPACE_DIR/install/local_setup.bash" >> ~/.bashrc
+if ! grep -Fq "install/local_setup.bash" ~/.bashrc; then
+  echo "if [ -f \"$WORKSPACE_DIR/install/local_setup.bash\" ]; then source \"$WORKSPACE_DIR/install/local_setup.bash\"; fi" >> ~/.bashrc
 fi
 
 source /opt/ros/$ROS_DISTRO/setup.bash
