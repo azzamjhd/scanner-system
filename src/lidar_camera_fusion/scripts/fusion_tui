@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Console-script shim that ament installs as `ros2 run lidar_camera_fusion fusion_tui`."""
+import os
+
+# Suppress CycloneDDS missing type hash warnings from corrupting the Curses TUI layout
+os.environ["RCUTILS_LOGGING_SEVERITY_THRESHOLD"] = "ERROR"
+# Force headless mode to bypass PyQt5 signals (which require a running Qt Event Loop)
+os.environ["FORCE_HEADLESS"] = "1"
+
+from lidar_camera_fusion.fusion_tui import main
+
+if __name__ == "__main__":
+    main()

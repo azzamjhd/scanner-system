@@ -149,9 +149,10 @@ install(TARGETS
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
-# Install the Python entry-point so `ros2 run lidar_camera_fusion fusion_gui` works
+# Install the Python entry-point so `ros2 run lidar_camera_fusion fusion_gui`/`fusion_tui` works
 install(PROGRAMS
   scripts/fusion_gui
+  scripts/fusion_tui
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -165,6 +166,10 @@ install(DIRECTORY launch/
 
 install(DIRECTORY urdf/
   DESTINATION share/${PROJECT_NAME}/urdf
+)
+
+install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
 )
 
 # ─── Python scripts ─────────────────────────────────────────────────────────

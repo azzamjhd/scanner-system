@@ -35,6 +35,14 @@
   <!-- PCL ↔ ROS2 bridge (pcl_ros not required) -->
   <depend>pcl_conversions</depend>
 
+  <!-- Launch/runtime packages used by hardware_only.launch.py.
+       micro_ros_agent and rplidar_ros are intentionally not declared here:
+       they are often installed/built separately and may not have rosdep keys. -->
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>v4l2_camera</exec_depend>
+
   <!-- System PCL (no ROS wrapper). body_preprocess_node also needs the
        segmentation / filters / sample_consensus / search / kdtree libs. -->
   <build_depend>libpcl-all-dev</build_depend>
