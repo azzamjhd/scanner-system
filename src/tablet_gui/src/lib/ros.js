@@ -79,7 +79,7 @@ function subscribeToTelemetry() {
     ros: rosClient,
     name: '/point_cloud/downsampled',
     messageType: 'sensor_msgs/PointCloud2',
-    throttle_rate: 250 // Throttle websocket JSON payload rate (max ~4 fps) to avoid blocking JS event loop
+    throttle_rate: 500 // 500ms (2 FPS) for smooth remote Tailscale playback without choking bandwidth/event-loop
   });
 
   cloudSub.subscribe((message) => {

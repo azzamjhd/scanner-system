@@ -39,18 +39,23 @@
     let rawBytes;
     if (typeof msg.data === 'string') {
       const binaryStr = atob(msg.data);
-      rawBytes = new Uint8Array(binaryStr.length);
-      for (let i = 0; i < binaryStr.length; i++) {
+      const len = binaryStr.length;
+      rawBytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
         rawBytes[i] = binaryStr.charCodeAt(i);
       }
     } else {
-      // Fallback if already an array (shouldn't happen via rosbridge JSON)
       rawBytes = new Uint8Array(msg.data);
     }
 
     const dataView = new DataView(rawBytes.buffer);
     const pointStep = msg.point_step;
-    const numPoints = Math.floor(rawBytes.byteLength / pointStep);
+    const totalPoints = Math.floor(rawBytes.byteLength / pointStep);
+
+    // Dynamic stride for bandwidth/mobile optimization:
+    // Over WAN/Tailscale, sample points to keep array allocations & loop iterations minimal.
+    // If totalPoints > 20000, take every 2nd or 3rd point.
+    const stepRatio = totalPoints > 40000 ? 3 : (totalPoints > 20000 ? 2 : 1);
 
     const positions = [];
     const colors = [];
@@ -64,7 +69,7 @@
       if (f.name === 'rgb') rgbOffset = f.offset;
     }
 
-    for (let i = 0; i < numPoints; i++) {
+    for (let i = 0; i < totalPoints; i += stepRatio) {
       const base = i * pointStep;
       if (base + zOffset + 4 > rawBytes.byteLength) break;
 
