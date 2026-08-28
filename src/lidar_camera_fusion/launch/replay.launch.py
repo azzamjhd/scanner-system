@@ -87,7 +87,11 @@ def generate_launch_description():
     rosbridge_launch_file = os.path.join(rosbridge_share, 'launch', 'rosbridge_websocket_launch.xml')
     rosbridge_launch = IncludeLaunchDescription(
         AnyLaunchDescriptionSource(rosbridge_launch_file),
-        launch_arguments={'use_sim_time': LaunchConfiguration('use_sim_time')}.items(),
+        launch_arguments={
+            'use_sim_time': LaunchConfiguration('use_sim_time'),
+            'address': '0.0.0.0',
+            'port': '9090',
+        }.items(),
         condition=IfCondition(LaunchConfiguration('launch_rosbridge')),
     )
 
