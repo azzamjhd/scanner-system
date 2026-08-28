@@ -15,7 +15,15 @@ export function initRos(url = 'ws://localhost:9090') {
   if (typeof window === 'undefined') return null; // Avoid running during build time
 
   if (rosClient) {
-    return rosClient;
+    const socket = rosClient.socket;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      return rosClient;
+    }
+
+    if (socket && socket.readyState !== WebSocket.CLOSED) {
+      rosClient.close();
+    }
+    rosClient = null;
   }
 
   rosClient = new ROSLIB.Ros({ url });
@@ -33,6 +41,15 @@ export function initRos(url = 'ws://localhost:9090') {
 
   rosClient.on('close', () => {
     console.warn('ROSbridge Connection Closed.');
+    if (posSub) {
+      posSub.unsubscribe();
+      posSub = null;
+    }
+    if (cloudSub) {
+      cloudSub.unsubscribe();
+      cloudSub = null;
+    }
+    rosClient = null;
     rosConnected.set(false);
   });
 

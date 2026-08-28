@@ -95,9 +95,9 @@
       geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
 
       const material = new THREE.PointsMaterial({
-        size: 0.015,
+        size: 0.01,
         vertexColors: true,
-        transparent: true,
+        // transparent: true,
         opacity: 0.8
       });
 
@@ -192,18 +192,26 @@
 
   export function resetCamera() {
     if (!camera || !controls) return;
-    camera.position.set(0, -1.8, 1.8);
-    controls.target.set(0, 0, 0);
+    camera.position.set(0.825, 0, 1.2);
+    controls.target.set(0.825, 0, 0);
     controls.update();
   }
 
   onMount(() => {
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0e0e0e);
-
+    
     camera = new THREE.PerspectiveCamera(60, canvasContainer.clientWidth / canvasContainer.clientHeight, 0.1, 100);
-    camera.position.set(0, -1.8, 1.8);
-    camera.lookAt(0, 0, 0);
+    // camera = new THREE.OrthographicCamera(
+    //   canvasContainer.clientWidth / -500, 
+    //   canvasContainer.clientWidth / 500, 
+    //   canvasContainer.clientHeight / 500, 
+    //   canvasContainer.clientHeight / -500, 
+    //   0.1, 
+    //   100
+    // );
+    camera.position.set(0.825, 0, 1.2);
+    camera.lookAt(0.825, 0, 0);
 
     renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(canvasContainer.clientWidth, canvasContainer.clientHeight);
@@ -214,18 +222,20 @@
     controls.enableDamping = true;
     controls.dampingFactor = 0.05;
     controls.screenSpacePanning = true;
-    controls.maxPolarAngle = Math.PI / 2 + 0.1;
-    controls.target.set(0, 0, 0);
+    controls.maxPolarAngle = Math.PI + 0.1;
+    controls.target.set(0.825, 0, 0);
     controls.update();
 
     // Bed plane visualization grid
-    const grid = new THREE.GridHelper(3.0, 30, 0x34495e, 0x1d2731);
+    const grid = new THREE.GridHelper(2.0, 10, 0x34495e, 0x1d2731);
     grid.rotation.x = Math.PI / 2;
-    scene.add(grid);
+    grid.position.x = 1.0;
+    // scene.add(grid);
 
     // Gantry carriage physical object mock representation
-    const gantryGeom = new THREE.BoxGeometry(0.1, 0.5, 0.1);
-    const gantryMat = new THREE.MeshBasicMaterial({ color: 0x9b59b6, wireframe: true });
+    const gantryGeom = new THREE.BoxGeometry(0.01, 0.8, 0.5);
+    gantryGeom.translate(0, 0, 0.25); // Center the box on the X-axis
+    const gantryMat = new THREE.MeshBasicMaterial({ color: 0x3498db, wireframe: false, transparent: true, opacity: 0.4 });
     gantryMesh = new THREE.Mesh(gantryGeom, gantryMat);
     scene.add(gantryMesh);
 
