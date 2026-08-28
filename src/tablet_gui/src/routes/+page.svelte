@@ -377,4 +377,50 @@
     50% { transform: scale(0.98); }
     100% { transform: scale(1); }
   }
+
+  /* Responsive breakpoints for tablets and mobile devices */
+  @media (max-width: 900px) {
+    .app-layout {
+      flex-direction: column;
+      height: auto;
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    .control-sidebar {
+      width: 100%;
+      height: auto;
+      border-right: none;
+      border-bottom: 1px solid #2d2d2d;
+      gap: 12px;
+    }
+
+    .abort-button {
+      margin-top: 12px;
+    }
+
+    .viewport-main {
+      height: 75vh;
+      min-height: 500px;
+    }
+
+    .visualizer-container {
+      padding: 8px;
+    }
+
+    .logs-console {
+      height: 140px;
+    }
+  }
+
+  @media (max-width: 500px) {
+    .control-sidebar {
+      padding: 12px;
+    }
+
+    .viewport-main {
+      height: 65vh;
+      min-height: 400px;
+    }
+  }
 </style>
